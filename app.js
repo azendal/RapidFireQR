@@ -345,21 +345,137 @@ window.clearSelectedFile = function() {
     document.getElementById('beam-stats').innerText = 'Stream idle';
 };
 
+// Compress image to lightweight WebP if it's a photo/image
+async function compressImageToWebp(file, maxDimension = 1280, quality = 0.78) {
+    return new Promise((resolve) => {
+        const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|webp|bmp|gif)$/i.test(file.name);
+        if (!isImage || file.type === 'image/svg+xml') {
+            resolve(null);
+            return;
+        }
+
+        const img = new Image();
+        const url = URL.createObjectURL(file);
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            let { width, height } = img;
+
+            // Scale down if larger than maxDimension
+            if (width > maxDimension || height > maxDimension) {
+                if (width > height) {
+                    height = Math.round((height * maxDimension) / width);
+                    width = maxDimension;
+                } else {
+                    width = Math.round((width * maxDimension) / height);
+                    height = maxDimension;
+                }
+            }
+
+            const canvas = document.createElement('canvas');
+            canvas.width = width;
+            canvas.height = height;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(img, 0, 0, width, height);
+
+            canvas.toBlob((blob) => {
+                if (!blob) {
+                    resolve(null);
+                    return;
+                }
+                blob.arrayBuffer().then(buf => {
+                    resolve({
+                        bytes: new Uint8Array(buf),
+                        size: blob.size,
+                        width,
+                        height
+                    });
+                });
+            }, 'image/webp', quality);
+        };
+        img.onerror = () => {
+            URL.revokeObjectURL(url);
+            resolve(null);
+        };
+        img.src = url;
+    });
+}
+
+// Convert a WebP blob back to original format (e.g. image/jpeg or image/png) on receiver
+async function convertBlobToTargetMime(blob, targetMime, quality = 0.9) {
+    return new Promise((resolve) => {
+        if (!targetMime || targetMime === blob.type || targetMime === 'image/webp') {
+            resolve(blob);
+            return;
+        }
+        const img = new Image();
+        const url = URL.createObjectURL(blob);
+        img.onload = () => {
+            URL.revokeObjectURL(url);
+            const canvas = document.createElement('canvas');
+            canvas.width = img.width;
+            canvas.height = img.height;
+            const ctx = canvas.getContext('2d');
+            // If target is JPEG, fill white background for transparent pixels
+            if (targetMime === 'image/jpeg') {
+                ctx.fillStyle = '#FFFFFF';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+            }
+            ctx.drawImage(img, 0, 0);
+            canvas.toBlob((resBlob) => {
+                resolve(resBlob || blob);
+            }, targetMime, quality);
+        };
+        img.onerror = () => {
+            URL.revokeObjectURL(url);
+            resolve(blob);
+        };
+        img.src = url;
+    });
+}
+
 window.handleFileSelected = async function(file) {
     if (!file) return;
-    if (file.size > 1024 * 1024) {
-        alert('For optical air-gap transfers, files under 1 MB are recommended.');
+
+    const optToggle = document.getElementById('toggle-optimize-image');
+    const shouldOptimize = optToggle ? optToggle.checked : true;
+
+    let payloadBytes = null;
+    let transferMime = file.type;
+    let isWebpOptimized = false;
+    let originalSize = file.size;
+
+    // Check if image optimization applies
+    if (shouldOptimize && (file.type.startsWith('image/') || /\.(png|jpe?g|bmp)$/i.test(file.name))) {
+        document.getElementById('beam-stats').innerText = 'Optimizing image for air-gap...';
+        const optimized = await compressImageToWebp(file, 1280, 0.78);
+        if (optimized && optimized.size < file.size) {
+            payloadBytes = optimized.bytes;
+            transferMime = 'image/webp';
+            isWebpOptimized = true;
+        }
     }
 
-    const arrayBuffer = await file.arrayBuffer();
-    const fileBytes = new Uint8Array(arrayBuffer);
+    if (!payloadBytes) {
+        const arrayBuffer = await file.arrayBuffer();
+        payloadBytes = new Uint8Array(arrayBuffer);
+    }
 
-    // Pack file with JSON metadata header: { name, type, size, isFile: true } + "\n---\n" + binary payload
-    const meta = JSON.stringify({ name: file.name, type: file.type, size: file.size, isFile: true });
+    // Pack file with JSON metadata header:
+    // { name, type, originalType: file.type, size, isFile: true, isWebpOptimized } + "\n---\n" + binary payload
+    const meta = JSON.stringify({
+        name: file.name,
+        type: transferMime,
+        originalType: file.type || 'application/octet-stream',
+        size: payloadBytes.length,
+        originalSize: originalSize,
+        isFile: true,
+        isWebpOptimized
+    });
+
     const metaBytes = new TextEncoder().encode(meta + '\n---\n');
-    const combinedBytes = new Uint8Array(metaBytes.length + fileBytes.length);
+    const combinedBytes = new Uint8Array(metaBytes.length + payloadBytes.length);
     combinedBytes.set(metaBytes, 0);
-    combinedBytes.set(fileBytes, metaBytes.length);
+    combinedBytes.set(payloadBytes, metaBytes.length);
 
     loadedFilePayload = {
         name: file.name,
@@ -367,13 +483,17 @@ window.handleFileSelected = async function(file) {
         bytes: combinedBytes
     };
 
+    const optLabel = isWebpOptimized
+        ? ` (${(originalSize / 1024).toFixed(1)} KB → ${(payloadBytes.length / 1024).toFixed(1)} KB WebP)`
+        : ` (${(file.size / 1024).toFixed(1)} KB)`;
+
     const input = document.getElementById('send-input');
-    input.value = `[File Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB)]\nClick "Start Beaming" to transmit.`;
+    input.value = `[File Selected: ${file.name}${optLabel}]\nClick "Start Beaming" to transmit.`;
 
     // Render Sender Preview
     renderFilePreview(file, file.name, file.type, 'sender-file-preview', 'sender-preview-title');
 
-    await preparePayload(combinedBytes, `${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
+    await preparePayload(combinedBytes, `${file.name}${optLabel}`);
 };
 
 async function preparePayload(bytes, label) {
@@ -847,15 +967,21 @@ async function onTransferComplete() {
                 const fileBytes = decompressed.subarray(headerByteLength);
 
                 const blob = new Blob([fileBytes], { type: meta.type || 'application/octet-stream' });
-                receivedFileBlob = { blob, name: meta.name || 'received_file' };
+                receivedFileBlob = {
+                    blob,
+                    name: meta.name || 'received_file',
+                    originalType: meta.originalType || meta.type,
+                    isWebpOptimized: Boolean(meta.isWebpOptimized)
+                };
                 isFilePayload = true;
 
-                decodedText = `[Received File: ${meta.name}]\nType: ${meta.type || 'application/octet-stream'}\nSize: ${(meta.size / 1024).toFixed(1)} KB (${meta.size} bytes)\n\nClick "Download File" below to save to your device.`;
+                const origSizeStr = meta.originalSize ? ` (originally ${(meta.originalSize / 1024).toFixed(1)} KB)` : '';
+                decodedText = `[Received File: ${meta.name}]\nFormat: ${meta.originalType || meta.type}${meta.isWebpOptimized ? ' (Air-gap compressed via WebP)' : ''}\nSize: ${(meta.size / 1024).toFixed(1)} KB${origSizeStr}\n\nClick "Download File" to save as ${meta.name}.`;
                 document.getElementById('result-text').value = decodedText;
 
                 if (downloadBtn) {
                     downloadBtn.style.display = 'inline-flex';
-                    downloadBtn.innerText = `Download (${(meta.size / 1024).toFixed(1)} KB)`;
+                    downloadBtn.innerText = `Download File`;
                 }
 
                 // Render Receiver File Preview
@@ -933,12 +1059,28 @@ window.copyResult = function() {
     }, 2000);
 };
 
-window.downloadResultFile = function() {
+window.downloadResultFile = async function() {
     if (!receivedFileBlob || !receivedFileBlob.blob) {
         alert('No file available to download.');
         return;
     }
-    const url = URL.createObjectURL(receivedFileBlob.blob);
+
+    const downloadBtn = document.getElementById('btn-download-result');
+    if (downloadBtn) downloadBtn.innerText = 'Preparing download...';
+
+    let finalBlob = receivedFileBlob.blob;
+
+    // If the file was optical-compressed as WebP but the original file was JPEG/PNG,
+    // convert it back to the user's original format seamlessly!
+    if (receivedFileBlob.isWebpOptimized && receivedFileBlob.originalType && receivedFileBlob.originalType !== 'image/webp') {
+        try {
+            finalBlob = await convertBlobToTargetMime(receivedFileBlob.blob, receivedFileBlob.originalType);
+        } catch (e) {
+            console.warn('Could not re-encode to original MIME, downloading as received', e);
+        }
+    }
+
+    const url = URL.createObjectURL(finalBlob);
     const a = document.createElement('a');
     a.href = url;
     a.download = receivedFileBlob.name || 'download';
@@ -946,6 +1088,8 @@ window.downloadResultFile = function() {
     a.click();
     document.body.removeChild(a);
     setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    if (downloadBtn) downloadBtn.innerText = 'Download File';
 
     const origStatus = document.getElementById('recv-status').innerText;
     document.getElementById('recv-status').innerText = `Downloaded ${receivedFileBlob.name}`;
