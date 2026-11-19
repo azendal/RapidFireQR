@@ -30,7 +30,63 @@ let lastFpsTime = performance.now();
 const offscreenCanvas = document.createElement('canvas');
 const offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
 
-// --- Helper Functions ---
+// --- High-Efficiency Z85 (Base85) Binary Codec ---
+// RFC 1924 / Z85 Alphabet: 85 printable ASCII characters safe for QR codes
+const Z85_CHARS = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#';
+const Z85_MAP = new Uint8Array(256);
+for (let i = 0; i < 85; i++) {
+    Z85_MAP[Z85_CHARS.charCodeAt(i)] = i;
+}
+
+function encodeZ85(bytes) {
+    const len = bytes.length;
+    const remainder = len % 4;
+    const padLen = remainder === 0 ? len : len + (4 - remainder);
+    let str = remainder.toString(); // leading digit 0..3 encodes unpadded remainder
+
+    for (let i = 0; i < padLen; i += 4) {
+        let val = 0;
+        for (let j = 0; j < 4; j++) {
+            const b = (i + j < len) ? bytes[i + j] : 0;
+            val = (val * 256) + b;
+        }
+        let div = 52200625; // 85^4
+        for (let j = 0; j < 5; j++) {
+            const digit = Math.floor(val / div) % 85;
+            str += Z85_CHARS[digit];
+            div = Math.floor(div / 85);
+        }
+    }
+    return str;
+}
+
+function decodeZ85(str) {
+    const remainder = parseInt(str[0], 10);
+    const dataStr = str.slice(1);
+    const strLen = dataStr.length;
+    const numBlocks = Math.floor(strLen / 5);
+    const fullLen = numBlocks * 4;
+    const finalLen = remainder === 0 ? fullLen : fullLen - (4 - remainder);
+    const out = new Uint8Array(finalLen);
+
+    let outIdx = 0;
+    for (let i = 0; i < strLen; i += 5) {
+        let val = 0;
+        for (let j = 0; j < 5; j++) {
+            val = (val * 85) + Z85_MAP[dataStr.charCodeAt(i + j)];
+        }
+        for (let j = 0; j < 4; j++) {
+            const shift = (3 - j) * 8;
+            const b = (val >>> shift) & 0xFF;
+            if (outIdx < finalLen) {
+                out[outIdx++] = b;
+            }
+        }
+    }
+    return out;
+}
+
+// Fallback Base64 for legacy format compatibility
 function uint8ToBase64(bytes) {
     let binary = '';
     const len = bytes.byteLength;
@@ -245,20 +301,19 @@ function startSendingLoop() {
     if (sendInterval) clearInterval(sendInterval);
     const intervalMs = Math.round(1000 / targetFps);
 
-    // Send first droplet immediately
+    // Send first droplet immediately (using compact Z85 encoding: 'Z:' prefix)
     if (encoder) {
         const droplet = encoder.nextDroplet();
-        const b64 = uint8ToBase64(droplet);
+        const payload = `Z:${encodeZ85(droplet)}`;
         qrcodeInstance.clear();
-        qrcodeInstance.makeCode(`F:${b64}`);
+        qrcodeInstance.makeCode(payload);
         document.getElementById('beam-stats').innerText = `Droplet #${encoder.seed} · ${encoder.K} total chunks`;
     }
 
     sendInterval = setInterval(() => {
         if (!isSending || !encoder) return;
         const droplet = encoder.nextDroplet();
-        const b64 = uint8ToBase64(droplet);
-        const payload = `F:${b64}`;
+        const payload = `Z:${encodeZ85(droplet)}`;
         qrcodeInstance.clear();
         qrcodeInstance.makeCode(payload);
         document.getElementById('beam-stats').innerText = `Droplet #${encoder.seed} · ${encoder.K} total chunks`;
@@ -578,11 +633,12 @@ async function handleDecodedQR(data) {
         return;
     }
 
-    // Droplet QR
-    if (data.startsWith('F:')) {
-        const b64 = data.substring(2);
+    // Droplet QR (supports Z85 compact 'Z:' and legacy Base64 'F:')
+    if (data.startsWith('Z:') || data.startsWith('F:')) {
         try {
-            const packetBytes = base64ToUint8(b64);
+            const isZ85 = data.startsWith('Z:');
+            const encodedData = data.substring(2);
+            const packetBytes = isZ85 ? decodeZ85(encodedData) : base64ToUint8(encodedData);
             if (packetBytes.length >= 12) {
                 const incomingTransferId = new DataView(packetBytes.buffer, packetBytes.byteOffset, packetBytes.byteLength).getUint16(0, false);
                 // If a new transfer has arrived and we already had a completed state, reset receiver state
