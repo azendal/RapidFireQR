@@ -772,9 +772,16 @@
 
                         <textarea id="send-input" placeholder="Type text or paste payload to beam..."></textarea>
 
-                        <button class="btn" id="start-beam-btn" onclick="toggleSending()">
-                            Start Beaming
-                        </button>
+                        <div class="btn-group">
+                            <button class="btn" id="start-beam-btn" style="flex: 2;" onclick="toggleSending()">
+                                Start Beaming
+                            </button>
+                            <label class="btn btn-secondary" style="flex: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; margin: 0;">
+                                <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" style="width: 16px; height: 16px; margin-right: 6px;"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+                                Add File
+                                <input type="file" id="file-input" style="display: none;" onchange="handleFileSelected(this.files[0])">
+                            </label>
+                        </div>
                     </div>
 
                     <div class="card" id="speed-card" style="padding: 0.85rem 1.15rem; gap: 0.85rem;">
@@ -896,7 +903,10 @@
 
                 <!-- Result Card (appears directly under the progress pill) -->
                 <div class="result-card" id="result-box">
-                    <button class="btn" id="btn-copy-result" onclick="copyResult()">Copy to Clipboard</button>
+                    <div class="btn-group" style="width: 100%;">
+                        <button class="btn" id="btn-copy-result" style="flex: 1;" onclick="copyResult()">Copy to Clipboard</button>
+                        <button class="btn btn-secondary" id="btn-download-result" style="flex: 1; display: none;" onclick="downloadResultFile()">Download File</button>
+                    </div>
                     <textarea id="result-text" readonly></textarea>
                 </div>
             </div>

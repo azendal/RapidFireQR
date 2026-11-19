@@ -240,6 +240,7 @@ window.loadPreset = function(type) {
         sample = lines.join('\n').slice(0, 307200);
     }
 
+    loadedFilePayload = null; // Clear any file selection if preset is loaded
     const input = document.getElementById('send-input');
     input.value = sample;
     const textBytes = new TextEncoder().encode(sample);
@@ -269,6 +270,36 @@ window.setSpeed = function(fps) {
     }
 };
 
+let loadedFilePayload = null; // { name: string, type: string, bytes: Uint8Array }
+
+window.handleFileSelected = async function(file) {
+    if (!file) return;
+    if (file.size > 1024 * 1024) {
+        alert('For optical air-gap transfers, files under 1 MB are recommended.');
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const fileBytes = new Uint8Array(arrayBuffer);
+
+    // Pack file with JSON metadata header: { name, type, size, isFile: true } + "\n---\n" + binary payload
+    const meta = JSON.stringify({ name: file.name, type: file.type, size: file.size, isFile: true });
+    const metaBytes = new TextEncoder().encode(meta + '\n---\n');
+    const combinedBytes = new Uint8Array(metaBytes.length + fileBytes.length);
+    combinedBytes.set(metaBytes, 0);
+    combinedBytes.set(fileBytes, metaBytes.length);
+
+    loadedFilePayload = {
+        name: file.name,
+        type: file.type,
+        bytes: combinedBytes
+    };
+
+    const input = document.getElementById('send-input');
+    input.value = `[File Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB)]\nClick "Start Beaming" to transmit.`;
+
+    await preparePayload(combinedBytes, `${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
+};
+
 async function preparePayload(bytes, label) {
     document.getElementById('beam-stats').innerText = 'Compressing...';
     const compressed = await compressData(bytes);
@@ -283,14 +314,18 @@ window.toggleSending = async function() {
         return;
     }
 
-    const text = document.getElementById('send-input').value.trim();
-    if (!text) {
-        alert('Please enter or select text to beam.');
-        return;
+    // Check if we have an attached file payload, otherwise read text input
+    if (loadedFilePayload) {
+        await preparePayload(loadedFilePayload.bytes, `${loadedFilePayload.name}`);
+    } else {
+        const text = document.getElementById('send-input').value.trim();
+        if (!text) {
+            alert('Please enter text or select a file to beam.');
+            return;
+        }
+        const textBytes = new TextEncoder().encode(text);
+        await preparePayload(textBytes, `${text.length} chars`);
     }
-
-    const textBytes = new TextEncoder().encode(text);
-    await preparePayload(textBytes, `${text.length} chars`);
 
     const startBtn = document.getElementById('start-beam-btn');
     startBtn.innerText = 'Stop Beaming';
@@ -696,6 +731,8 @@ async function handleDecodedQR(data) {
     }
 }
 
+let receivedFileBlob = null; // { blob: Blob, name: string }
+
 async function onTransferComplete() {
     const rawCompressed = decoder.getRecoveredData();
     const decompressed = await decompressData(rawCompressed);
@@ -713,19 +750,57 @@ async function onTransferComplete() {
         navigator.vibrate([40, 50, 40]);
     }
 
-    // Try text decode
+    // Check if payload contains file packaging header: {"name":..."isFile":true}\n---\n<binary>
+    let isFilePayload = false;
     let decodedText = '';
+    receivedFileBlob = null;
+    const downloadBtn = document.getElementById('btn-download-result');
+
     try {
-        decodedText = new TextDecoder('utf-8', { fatal: true }).decode(decompressed);
-        document.getElementById('result-text').value = decodedText;
-    } catch {
-        decodedText = `[Binary Payload: ${decompressed.length} bytes]`;
-        document.getElementById('result-text').value = decodedText;
+        // Inspect up to first 1024 bytes for file metadata header
+        const inspectSlice = decompressed.subarray(0, Math.min(decompressed.length, 1024));
+        const headStr = new TextDecoder('utf-8', { fatal: false }).decode(inspectSlice);
+        const separator = '\n---\n';
+        const sepIdx = headStr.indexOf(separator);
+
+        if (sepIdx !== -1) {
+            const metaJsonStr = headStr.substring(0, sepIdx).trim();
+            if (metaJsonStr.startsWith('{') && metaJsonStr.includes('"isFile":true')) {
+                const meta = JSON.parse(metaJsonStr);
+                const headerByteLength = new TextEncoder().encode(metaJsonStr + separator).length;
+                const fileBytes = decompressed.subarray(headerByteLength);
+
+                const blob = new Blob([fileBytes], { type: meta.type || 'application/octet-stream' });
+                receivedFileBlob = { blob, name: meta.name || 'received_file' };
+                isFilePayload = true;
+
+                decodedText = `[Received File: ${meta.name}]\nType: ${meta.type || 'application/octet-stream'}\nSize: ${(meta.size / 1024).toFixed(1)} KB (${meta.size} bytes)\n\nClick "Download File" below to save to your device.`;
+                document.getElementById('result-text').value = decodedText;
+
+                if (downloadBtn) {
+                    downloadBtn.style.display = 'inline-flex';
+                    downloadBtn.innerText = `Download (${(meta.size / 1024).toFixed(1)} KB)`;
+                }
+            }
+        }
+    } catch (e) {
+        console.warn('File header detection error, falling back to standard decode', e);
     }
 
-    // Auto-copy to clipboard on mobile
+    if (!isFilePayload) {
+        if (downloadBtn) downloadBtn.style.display = 'none';
+        try {
+            decodedText = new TextDecoder('utf-8', { fatal: true }).decode(decompressed);
+            document.getElementById('result-text').value = decodedText;
+        } catch {
+            decodedText = `[Binary Payload: ${decompressed.length} bytes]`;
+            document.getElementById('result-text').value = decodedText;
+        }
+    }
+
+    // Auto-copy text to clipboard on mobile if plain text
     const isMobile = /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || window.innerWidth < 768;
-    if (isMobile && decodedText) {
+    if (isMobile && decodedText && !isFilePayload) {
         try {
             await navigator.clipboard.writeText(decodedText);
             const copyBtn = document.getElementById('btn-copy-result');
@@ -775,6 +850,27 @@ window.copyResult = function() {
     setTimeout(() => {
         document.getElementById('recv-status').innerText = origStatus;
     }, 2000);
+};
+
+window.downloadResultFile = function() {
+    if (!receivedFileBlob || !receivedFileBlob.blob) {
+        alert('No file available to download.');
+        return;
+    }
+    const url = URL.createObjectURL(receivedFileBlob.blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = receivedFileBlob.name || 'download';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+
+    const origStatus = document.getElementById('recv-status').innerText;
+    document.getElementById('recv-status').innerText = `Downloaded ${receivedFileBlob.name}`;
+    setTimeout(() => {
+        document.getElementById('recv-status').innerText = origStatus;
+    }, 2500);
 };
 
 // --- Tab / Screen Navigation ---
