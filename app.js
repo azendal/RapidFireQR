@@ -214,6 +214,30 @@ window.loadPreset = function(type) {
             `# ==============================================================================\n` +
             `# END OF BENCHMARK TRANSMISSION\n` +
             `# ==============================================================================`;
+    } else if (type === '50kb') {
+        const lines = ['# RAPIDFIRE 50KB BENCHMARK DATASET\n# Optical Air-Gap Diode Test\n'];
+        for (let i = 1; i <= 360; i++) {
+            const h1 = quickHash(`token_${i}_a`).repeat(2);
+            const h2 = quickHash(`token_${i}_b`).repeat(2);
+            lines.push(`function worker_${String(i).padStart(3, '0')}(ctx, res) { const token = "${h1}"; return { id: ${i}, valid: true, digest: "${h2}" }; }`);
+        }
+        sample = lines.join('\n').slice(0, 51200);
+    } else if (type === '100kb') {
+        const lines = ['# RAPIDFIRE 100KB BENCHMARK DATASET\n# Optical Air-Gap Diode Test\n'];
+        for (let i = 1; i <= 720; i++) {
+            const h1 = quickHash(`token_${i}_x`).repeat(2);
+            const h2 = quickHash(`token_${i}_y`).repeat(2);
+            lines.push(`function node_${String(i).padStart(4, '0')}(req, reply) { const session = "${h1}"; return { index: ${i}, ok: true, hash: "${h2}" }; }`);
+        }
+        sample = lines.join('\n').slice(0, 102400);
+    } else if (type === '300kb') {
+        const lines = ['# RAPIDFIRE 300KB HEAVY BENCHMARK DATASET\n# Optical Air-Gap Diode Test\n'];
+        for (let i = 1; i <= 2160; i++) {
+            const h1 = quickHash(`heavy_${i}_alpha`).repeat(2);
+            const h2 = quickHash(`heavy_${i}_beta`).repeat(2);
+            lines.push(`function cluster_${String(i).padStart(4, '0')}(event) { const cert = "${h1}"; return { clusterId: ${i}, ack: true, sig: "${h2}" }; }`);
+        }
+        sample = lines.join('\n').slice(0, 307200);
     }
 
     const input = document.getElementById('send-input');
