@@ -53,13 +53,24 @@
         }
         .brand {
             display: flex;
-            align-items: center;
+            align-items: baseline;
+            gap: 0.5rem;
         }
         .brand-title {
             font-size: 1.4rem;
             font-weight: 700;
             color: var(--accent);
             letter-spacing: -0.5px;
+        }
+        .version-tag {
+            font-size: 0.72rem;
+            font-weight: 600;
+            color: var(--text-secondary);
+            background: var(--surface-elevated);
+            border: 1px solid var(--border);
+            padding: 0.15rem 0.45rem;
+            border-radius: 999px;
+            letter-spacing: 0.2px;
         }
 
         /* Main Container */
@@ -800,6 +811,7 @@
     <header>
         <div class="brand">
             <span class="brand-title">RapidFireQR</span>
+            <span class="version-tag">v1.01</span>
         </div>
     </header>
 
