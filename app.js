@@ -241,6 +241,8 @@ window.loadPreset = function(type) {
     }
 
     loadedFilePayload = null; // Clear any file selection if preset is loaded
+    const senderPreview = document.getElementById('sender-file-preview');
+    if (senderPreview) senderPreview.style.display = 'none';
     const input = document.getElementById('send-input');
     input.value = sample;
     const textBytes = new TextEncoder().encode(sample);
@@ -272,6 +274,77 @@ window.setSpeed = function(fps) {
 
 let loadedFilePayload = null; // { name: string, type: string, bytes: Uint8Array }
 
+// Utility to render file preview into a container
+function renderFilePreview(blob, filename, mimeType, containerId, titleId) {
+    const container = document.getElementById(containerId);
+    const body = document.getElementById(containerId.replace('file-preview', 'preview-body'));
+    const title = document.getElementById(titleId);
+
+    if (!container || !body) return;
+
+    if (title) {
+        title.innerText = `${filename} (${(blob.size / 1024).toFixed(1)} KB)`;
+    }
+
+    body.innerHTML = '';
+    container.style.display = 'flex';
+
+    const lowerName = filename.toLowerCase();
+    const isImage = mimeType.startsWith('image/') || /\.(png|jpe?g|gif|webp|svg|bmp|ico)$/i.test(lowerName);
+    const isText = mimeType.startsWith('text/') || /\.(txt|json|md|csv|js|ts|html|css|py|sh|xml|yml|yaml|ini|log)$/i.test(lowerName);
+    const isPdf = mimeType === 'application/pdf' || lowerName.endsWith('.pdf');
+
+    if (isImage) {
+        const img = document.createElement('img');
+        img.src = URL.createObjectURL(blob);
+        img.onload = () => URL.revokeObjectURL(img.src);
+        body.appendChild(img);
+    } else if (isText) {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const pre = document.createElement('pre');
+            const content = reader.result;
+            pre.textContent = content.length > 5000 ? content.slice(0, 5000) + '\n... [Preview Truncated]' : content;
+            body.appendChild(pre);
+        };
+        reader.readAsText(blob.slice(0, 51200));
+    } else if (isPdf) {
+        const badge = document.createElement('div');
+        badge.className = 'file-preview-badge';
+        badge.innerHTML = `
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z"/></svg>
+            <div>
+                <div style="font-weight:600; color:var(--text-primary);">PDF Document</div>
+                <div>${(blob.size / 1024).toFixed(1)} KB · Ready to transmit</div>
+            </div>
+        `;
+        body.appendChild(badge);
+    } else {
+        const badge = document.createElement('div');
+        badge.className = 'file-preview-badge';
+        const ext = lowerName.split('.').pop()?.toUpperCase() || 'FILE';
+        badge.innerHTML = `
+            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/></svg>
+            <div>
+                <div style="font-weight:600; color:var(--text-primary);">${ext} Binary Archive / Data</div>
+                <div>${(blob.size / 1024).toFixed(1)} KB · ${mimeType || 'application/octet-stream'}</div>
+            </div>
+        `;
+        body.appendChild(badge);
+    }
+}
+
+window.clearSelectedFile = function() {
+    loadedFilePayload = null;
+    const fileInput = document.getElementById('file-input');
+    if (fileInput) fileInput.value = '';
+    const preview = document.getElementById('sender-file-preview');
+    if (preview) preview.style.display = 'none';
+    const input = document.getElementById('send-input');
+    if (input) input.value = '';
+    document.getElementById('beam-stats').innerText = 'Stream idle';
+};
+
 window.handleFileSelected = async function(file) {
     if (!file) return;
     if (file.size > 1024 * 1024) {
@@ -296,6 +369,9 @@ window.handleFileSelected = async function(file) {
 
     const input = document.getElementById('send-input');
     input.value = `[File Selected: ${file.name} (${(file.size / 1024).toFixed(1)} KB)]\nClick "Start Beaming" to transmit.`;
+
+    // Render Sender Preview
+    renderFilePreview(file, file.name, file.type, 'sender-file-preview', 'sender-preview-title');
 
     await preparePayload(combinedBytes, `${file.name} (${(file.size / 1024).toFixed(1)} KB)`);
 };
@@ -781,6 +857,9 @@ async function onTransferComplete() {
                     downloadBtn.style.display = 'inline-flex';
                     downloadBtn.innerText = `Download (${(meta.size / 1024).toFixed(1)} KB)`;
                 }
+
+                // Render Receiver File Preview
+                renderFilePreview(blob, meta.name, meta.type || '', 'receiver-file-preview', 'receiver-preview-title');
             }
         }
     } catch (e) {
@@ -789,6 +868,8 @@ async function onTransferComplete() {
 
     if (!isFilePayload) {
         if (downloadBtn) downloadBtn.style.display = 'none';
+        const recvPreview = document.getElementById('receiver-file-preview');
+        if (recvPreview) recvPreview.style.display = 'none';
         try {
             decodedText = new TextDecoder('utf-8', { fatal: true }).decode(decompressed);
             document.getElementById('result-text').value = decodedText;
