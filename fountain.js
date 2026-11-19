@@ -36,7 +36,7 @@ function getBlockIndices(seed, K) {
 }
 
 export class FountainEncoder {
-    constructor(dataBytes, chunkSize = 160, transferId = null) {
+    constructor(dataBytes, chunkSize = 350, transferId = null) {
         this.chunkSize = chunkSize;
         this.totalLength = dataBytes.length;
         this.K = Math.max(1, Math.ceil(this.totalLength / chunkSize));

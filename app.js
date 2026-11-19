@@ -192,7 +192,7 @@ window.setSpeed = function(fps) {
 async function preparePayload(bytes, label) {
     document.getElementById('beam-stats').innerText = 'Compressing...';
     const compressed = await compressData(bytes);
-    encoder = new FountainEncoder(compressed, 160); // 160 bytes chunk size
+    encoder = new FountainEncoder(compressed, 350); // 350 bytes chunk size (2.2x throughput)
     currentTransferHash = quickHash(bytes.length + '_' + compressed.length);
     document.getElementById('beam-stats').innerText = `${label || bytes.length + ' B'} → ${compressed.length} B in ${encoder.K} blocks`;
 }
