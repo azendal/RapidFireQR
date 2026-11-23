@@ -1,12 +1,40 @@
-import { FountainEncoder, FountainDecoder } from './fountain.js';
+import { FountainEncoder, FountainDecoder, HEADER_BYTES, readHeader } from './fountain.js';
+import { encodeQR, alphanumericCapacity } from './qr.js';
+import { base45Encode, base45Decode, bytesForChars } from './base45.js';
+import { packPayload, unpackPayload } from './envelope.js';
+import { cardLayout, paintCard, CardAnalyzer, defaultGreys } from './card.js';
+import { rfcPlan, buildFrame, readFrame, paintFrame, threshold } from './rfc.js';
+import { GpuSampler } from './gpusample.js';
+
+// --- Frame format ---
+// Each frame is an alphanumeric-mode QR holding PACKET_PREFIX + base45(packet).
+// The code size picks the largest QR version used; packets are sized to fill it at level L.
+// The receiver needs no setting: every frame carries its own size.
+// The fountain carries an envelope (see envelope.js): compression flag + checksum + body.
+const PACKET_PREFIX = 'F3:';
+const LEGACY_PREFIX = /^F\d*:/; // frames from older versions (F:, F2:)
+const FRAME_SIZES = { S: 10, M: 15, L: 20, XL: 25 };
+const SIZE_STORAGE_KEY = 'rapidfire.frameSize';
+let frameSize = 'S';
+try {
+    const saved = localStorage.getItem(SIZE_STORAGE_KEY);
+    if (saved in FRAME_SIZES) frameSize = saved;
+} catch (e) {}
+
+function maxChunkBytes() {
+    const version = FRAME_SIZES[frameSize];
+    return bytesForChars(alphanumericCapacity(version, 'L') - PACKET_PREFIX.length) - HEADER_BYTES;
+}
 
 // --- Global State ---
 let isSending = false;
-let sendInterval = null;
+let sendRafId = null;
+let lastSwapTime = -Infinity;
 let targetFps = 8;
 let encoder = null;
 let currentTransferHash = '';
-let qrcodeInstance = null;
+let frameCanvas = null;
+let frameCtx = null;
 let autoStopWithCamera = false;
 let senderStream = null;
 let senderWatcherScanning = false;
@@ -16,6 +44,10 @@ window.toggleAckWatcher = function(enabled) {
 };
 
 let decoder = new FountainDecoder();
+let cameraOverrides = {};  // { width, height, frameRate, facing }, set by the lab remote
+let cardBusy = false;      // receiver is measuring the test card (QR scanning paused)
+let cardRun = null;        // sender is showing the test card
+let rfcRun = null;         // sender is beaming RapidFire code v1
 let videoStream = null;
 let currentFacingMode = 'environment';
 let isScanning = false;
@@ -30,60 +62,47 @@ let lastFpsTime = performance.now();
 const offscreenCanvas = document.createElement('canvas');
 const offscreenCtx = offscreenCanvas.getContext('2d', { willReadFrequently: true });
 
+// --- Lab telemetry ---
+// On a home-network or localhost address, both ends report measurements (never payload
+// contents) to POST /api/telemetry on the server that served the page. On a public host
+// (Vercel) this is off.
+const LAB_MODE = /^(localhost|127\.|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)|\.local$/.test(location.hostname);
+const DEVICE_ID = (() => {
+    try {
+        let id = localStorage.getItem('rapidfire.deviceId');
+        if (!id) {
+            id = Math.random().toString(36).slice(2, 8);
+            localStorage.setItem('rapidfire.deviceId', id);
+        }
+        return id;
+    } catch (e) {
+        return 'anon';
+    }
+})();
+const DEVICE_INFO = {
+    ua: navigator.userAgent,
+    screen: `${screen.width}x${screen.height}@${window.devicePixelRatio || 1}`,
+};
+
+// Bump with CACHE_NAME in sw.js, so reports show which build each device is running
+const APP_VERSION = '2.16';
+
+function report(event, data = {}) {
+    if (!LAB_MODE) return;
+    const body = JSON.stringify({ event, device: DEVICE_ID, v: APP_VERSION, t: Date.now(), ...data });
+    try {
+        if (navigator.sendBeacon) navigator.sendBeacon('/api/telemetry', new Blob([body], { type: 'application/json' }));
+        else fetch('/api/telemetry', { method: 'POST', body, keepalive: true, headers: { 'Content-Type': 'application/json' } }).catch(() => {});
+    } catch (e) {}
+}
+
+report('page-open', { ...DEVICE_INFO, url: location.origin + location.pathname + location.search });
+
 // --- Helper Functions ---
-function uint8ToBase64(bytes) {
-    let binary = '';
-    const len = bytes.byteLength;
-    for (let i = 0; i < len; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    return window.btoa(binary);
-}
-
-function base64ToUint8(base64) {
-    const binary = window.atob(base64);
-    const len = binary.length;
-    const bytes = new Uint8Array(len);
-    for (let i = 0; i < len; i++) {
-        bytes[i] = binary.charCodeAt(i);
-    }
-    return bytes;
-}
-
-// Compress data using browser-native GZIP/Deflate
-async function compressData(uint8Array) {
-    if ('CompressionStream' in window) {
-        try {
-            const cs = new CompressionStream('deflate-raw');
-            const writer = cs.writable.getWriter();
-            writer.write(uint8Array);
-            writer.close();
-            const response = new Response(cs.readable);
-            const arrayBuffer = await response.arrayBuffer();
-            return new Uint8Array(arrayBuffer);
-        } catch (e) {
-            console.warn('Compression failed, falling back to raw', e);
-        }
-    }
-    return uint8Array;
-}
-
-// Decompress data
-async function decompressData(uint8Array) {
-    if ('DecompressionStream' in window) {
-        try {
-            const ds = new DecompressionStream('deflate-raw');
-            const writer = ds.writable.getWriter();
-            writer.write(uint8Array);
-            writer.close();
-            const response = new Response(ds.readable);
-            const arrayBuffer = await response.arrayBuffer();
-            return new Uint8Array(arrayBuffer);
-        } catch (e) {
-            console.warn('Decompression failed, using raw', e);
-        }
-    }
-    return uint8Array;
+function formatBytes(n) {
+    if (n < 1024) return `${n} B`;
+    if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+    return `${(n / 1024 / 1024).toFixed(2)} MB`;
 }
 
 // Simple fast string hash
@@ -97,7 +116,7 @@ function quickHash(str) {
 }
 
 // --- Presets for Testing ---
-window.loadPreset = function(type) {
+window.loadPreset = function(type, randomKB = 50) {
     let sample = '';
     if (type === 'small') {
         sample = JSON.stringify({
@@ -160,10 +179,22 @@ window.loadPreset = function(type) {
             `# ==============================================================================`;
     }
 
+    if (type === 'random') {
+        // Random words (50 KB by default): compresses only partly, and any lost byte would fail the checksum
+        const words = [];
+        let size = 0;
+        while (size < randomKB * 1024) {
+            const word = Math.random().toString(36).slice(2, 3 + Math.floor(Math.random() * 8));
+            words.push(word);
+            size += word.length + 1;
+        }
+        sample = words.join(' ');
+    }
+
     const input = document.getElementById('send-input');
     input.value = sample;
     const textBytes = new TextEncoder().encode(sample);
-    preparePayload(textBytes, `${sample.length} bytes (${type})`);
+    return preparePayload(textBytes, `${sample.length} bytes (${type})`);
 };
 
 // --- Sender Implementation ---
@@ -180,21 +211,74 @@ window.setSpeed = function(fps) {
             safeBtn.classList.remove('active');
         }
     }
-    const mobileMeta = document.getElementById('mobile-stream-meta');
-    if (mobileMeta && encoder) {
-        mobileMeta.innerText = `${encoder.K} blocks · ${targetFps === 15 ? 'Turbo' : 'Safe'}`;
-    }
+    updateStreamMeta();
     if (isSending) {
         startSendingLoop();
+        report('beam-speed', { transferId: encoder.transferId, fps: targetFps, atFrame: encoder.lastId + 1 });
     }
 };
 
+function reportBeamStart(reason) {
+    report('beam-start', {
+        reason,
+        transferId: encoder.transferId,
+        size: frameSize,
+        version: FRAME_SIZES[frameSize],
+        fps: targetFps,
+        K: encoder.K,
+        chunk: encoder.chunkSize,
+        ...payloadMeta,
+        ...DEVICE_INFO,
+    });
+}
+
+function updateStreamMeta() {
+    const mobileMeta = document.getElementById('mobile-stream-meta');
+    if (mobileMeta && encoder) {
+        mobileMeta.innerText = `${encoder.K} blocks · ${targetFps === 15 ? 'Turbo' : 'Safe'} · Size ${frameSize}`;
+    }
+}
+
+function syncSizeButtons() {
+    document.querySelectorAll('[data-frame-size]').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.frameSize === frameSize);
+    });
+}
+
+// Changing size mid-beam restarts the transfer at the new size; the receiver
+// sees a new transfer id and starts over.
+window.setFrameSize = async function(size) {
+    if (!(size in FRAME_SIZES) || size === frameSize) return;
+    frameSize = size;
+    try { localStorage.setItem(SIZE_STORAGE_KEY, size); } catch (e) {}
+    syncSizeButtons();
+    if (lastPayload) {
+        const previous = isSending && encoder ? { transferId: encoder.transferId, framesShown: encoder.lastId + 1 } : null;
+        await preparePayload(lastPayload.bytes, lastPayload.label);
+        updateStreamMeta();
+        if (isSending) {
+            startSendingLoop();
+            if (previous) report('beam-stop', { ...previous, reason: 'size-change' });
+            reportBeamStart('size-change');
+        }
+    }
+};
+
+let lastPayload = null;
+let payloadMeta = {};
+
+let sendStartTime = null;
+
 async function preparePayload(bytes, label) {
+    lastPayload = { bytes, label };
     document.getElementById('beam-stats').innerText = 'Compressing...';
-    const compressed = await compressData(bytes);
-    encoder = new FountainEncoder(compressed, 160); // 160 bytes chunk size
-    currentTransferHash = quickHash(bytes.length + '_' + compressed.length);
-    document.getElementById('beam-stats').innerText = `${label || bytes.length + ' B'} → ${compressed.length} B in ${encoder.K} blocks`;
+    const { packed, compressed } = await packPayload(bytes);
+    encoder = new FountainEncoder(packed, maxChunkBytes());
+    payloadMeta = { bytes: bytes.length, sentBytes: packed.length, compressed };
+    sendStartTime = null;
+    currentTransferHash = quickHash(bytes.length + '_' + packed.length);
+    const how = compressed ? `compressed to ${formatBytes(packed.length)}` : `sent as is (${formatBytes(packed.length)})`;
+    document.getElementById('beam-stats').innerText = `${formatBytes(bytes.length)} ${how} · ${encoder.K} blocks of ${encoder.chunkSize} B`;
 }
 
 window.toggleSending = async function() {
@@ -220,19 +304,10 @@ window.toggleSending = async function() {
     // Trigger mobile focus layout (collapsing controls)
     const screenSend = document.getElementById('screen-send');
     if (screenSend) screenSend.classList.add('is-beaming');
-    const mobileMeta = document.getElementById('mobile-stream-meta');
-    if (mobileMeta) mobileMeta.innerText = `${encoder.K} blocks · ${targetFps === 15 ? 'Turbo' : 'Safe'}`;
+    updateStreamMeta();
+    reportBeamStart('start');
 
-    // Initialize QR Code generator instance
-    const container = document.getElementById('qr-canvas-container');
-    container.innerHTML = '';
-    qrcodeInstance = new QRCode(container, {
-        text: 'RAPIDFIRE_INIT',
-        width: 250,
-        height: 250,
-        correctLevel: QRCode.CorrectLevel.L // Level L for max capacity
-    });
-
+    setupFrameCanvas();
     startSendingLoop();
 
     // Start background camera ACK watcher if opted in
@@ -241,28 +316,77 @@ window.toggleSending = async function() {
     }
 };
 
-function startSendingLoop() {
-    if (sendInterval) clearInterval(sendInterval);
-    const intervalMs = Math.round(1000 / targetFps);
+function setupFrameCanvas() {
+    const container = document.getElementById('qr-canvas-container');
+    container.innerHTML = '';
+    frameCanvas = document.createElement('canvas');
+    container.appendChild(frameCanvas);
+    frameCtx = frameCanvas.getContext('2d', { alpha: false });
+}
 
-    // Send first droplet immediately
-    if (encoder) {
-        const droplet = encoder.nextDroplet();
-        const b64 = uint8ToBase64(droplet);
-        qrcodeInstance.clear();
-        qrcodeInstance.makeCode(`F:${b64}`);
-        document.getElementById('beam-stats').innerText = `Droplet #${encoder.seed} · ${encoder.K} total chunks`;
+// Draw a QR straight onto the canvas: whole device pixels per module, no smoothing,
+// one module of white margin (the container's padding adds the rest).
+function drawFrame(text) {
+    if (!frameCanvas) return;
+    const qr = encodeQR(text, { ecl: 'L' });
+    const container = frameCanvas.parentElement;
+    const cs = getComputedStyle(container);
+    const availW = container.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    const availH = container.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    const dpr = window.devicePixelRatio || 1;
+    const quiet = 1;
+    const span = qr.size + quiet * 2;
+    const scale = Math.max(1, Math.floor(Math.min(availW, availH) * dpr / span));
+    const px = span * scale;
+
+    if (frameCanvas.width !== px) {
+        frameCanvas.width = px;
+        frameCanvas.height = px;
+        frameCanvas.style.width = `${px / dpr}px`;
+        frameCanvas.style.height = `${px / dpr}px`;
     }
 
-    sendInterval = setInterval(() => {
+    const ctx = frameCtx;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, px, px);
+    ctx.fillStyle = '#000000';
+    const { size, modules } = qr;
+    for (let y = 0; y < size; y++) {
+        let x = 0;
+        while (x < size) {
+            if (!modules[y * size + x]) { x++; continue; }
+            const start = x;
+            while (x < size && modules[y * size + x]) x++;
+            ctx.fillRect((start + quiet) * scale, (y + quiet) * scale, (x - start) * scale, scale);
+        }
+    }
+}
+
+function showNextDroplet() {
+    const packet = encoder.nextDroplet();
+    drawFrame(PACKET_PREFIX + base45Encode(packet));
+    const now = performance.now();
+    if (sendStartTime === null) sendStartTime = now;
+    const elapsed = ((now - sendStartTime) / 1000).toFixed(1);
+    document.getElementById('beam-stats').innerText = `Frame #${encoder.lastId + 1} · ${encoder.K} blocks · ${encoder.chunkSize} B per frame · ${elapsed} s`;
+}
+
+// Frames change only inside requestAnimationFrame, so each swap lands on a screen refresh
+// and a camera never catches a half-drawn code.
+function startSendingLoop() {
+    if (sendRafId) cancelAnimationFrame(sendRafId);
+    lastSwapTime = -Infinity;
+    const tick = (now) => {
         if (!isSending || !encoder) return;
-        const droplet = encoder.nextDroplet();
-        const b64 = uint8ToBase64(droplet);
-        const payload = `F:${b64}`;
-        qrcodeInstance.clear();
-        qrcodeInstance.makeCode(payload);
-        document.getElementById('beam-stats').innerText = `Droplet #${encoder.seed} · ${encoder.K} total chunks`;
-    }, intervalMs);
+        const interval = 1000 / targetFps;
+        // A few ms of slack so a frame due between two refreshes goes out on the earlier one
+        if (now - lastSwapTime >= interval - 4) {
+            lastSwapTime = now - lastSwapTime < interval * 2 ? lastSwapTime + interval : now;
+            showNextDroplet();
+        }
+        sendRafId = requestAnimationFrame(tick);
+    };
+    sendRafId = requestAnimationFrame(tick);
 }
 
 const PLACEHOLDER_QR_SVG = `
@@ -381,7 +505,7 @@ async function scanSenderAckFrame() {
         }
 
         if (detectedAck) {
-            stopSending();
+            stopSending('ack');
             document.getElementById('beam-stats').innerText = 'Receiver confirmed (ACK detected). Done!';
             if ('vibrate' in navigator) {
                 navigator.vibrate([30, 40, 30]);
@@ -395,12 +519,22 @@ async function scanSenderAckFrame() {
     }
 }
 
-function stopSending() {
-    isSending = false;
-    if (sendInterval) {
-        clearInterval(sendInterval);
-        sendInterval = null;
+function stopSending(reason = 'user') {
+    if (isSending && encoder) {
+        report('beam-stop', {
+            transferId: encoder.transferId,
+            framesShown: encoder.lastId + 1,
+            seconds: sendStartTime === null ? 0 : +((performance.now() - sendStartTime) / 1000).toFixed(2),
+            reason,
+        });
     }
+    isSending = false;
+    if (sendRafId) {
+        cancelAnimationFrame(sendRafId);
+        sendRafId = null;
+    }
+    frameCanvas = null;
+    frameCtx = null;
     stopSenderAckWatcher();
 
     const startBtn = document.getElementById('start-beam-btn');
@@ -421,10 +555,7 @@ function stopSending() {
 // --- Receiver Implementation ---
 function stopReceiverCamera() {
     isScanning = false;
-    if (receiverAnimId) {
-        cancelAnimationFrame(receiverAnimId);
-        receiverAnimId = null;
-    }
+    cancelScan();
     if (videoStream) {
         videoStream.getTracks().forEach(track => {
             try { track.stop(); } catch(e) {}
@@ -445,14 +576,16 @@ async function initCamera() {
 
     const video = document.getElementById('camera-video');
     try {
+        const o = cameraOverrides; // set by the lab remote's "camera" command
         const constraints = {
             video: {
-                facingMode: { ideal: currentFacingMode },
-                width: { ideal: 1280 },
-                height: { ideal: 720 },
-                frameRate: { ideal: 30 }
+                width: { ideal: o.width || 1280 },
+                height: { ideal: o.height || 720 },
+                frameRate: { ideal: o.frameRate || 30 }
             }
         };
+        if (o.deviceId) constraints.video.deviceId = { exact: o.deviceId };
+        else constraints.video.facingMode = { ideal: o.facing || currentFacingMode };
         videoStream = await navigator.mediaDevices.getUserMedia(constraints);
         video.srcObject = videoStream;
         await video.play();
@@ -469,8 +602,30 @@ async function initCamera() {
             }
         }
 
+        const track = videoStream.getVideoTracks()[0];
+        const settings = track && track.getSettings ? track.getSettings() : {};
+        report('camera', {
+            width: video.videoWidth,
+            height: video.videoHeight,
+            frameRate: settings.frameRate,
+            facing: settings.facingMode || currentFacingMode,
+            focusMode: settings.focusMode,
+            label: track ? track.label : null,
+            detector: barcodeDetector ? 'BarcodeDetector' : 'jsQR',
+            parallel: barcodeDetector ? MAX_SCANS_IN_FLIGHT : 1,
+            scanPx: SCAN_PX,
+            ...DEVICE_INFO,
+        });
+
+        // Start the per-second counters fresh with the camera
+        frameCount = 0;
+        lastFpsTime = performance.now();
+        scanWindow = { codes: 0, newFrames: 0, detectorHits: 0, jsqrHits: 0, jsqrRuns: 0, ms: 0, done: 0, maxInFlight: 0, codePx: 0 };
+
+        presentedFrames = null;
+        cameraFramesInWindow = 0;
         isScanning = true;
-        receiverAnimId = requestAnimationFrame(scanVideoFrame);
+        scheduleScan();
     } catch (err) {
         if (err.name === 'AbortError' || (decoder && decoder.isDone)) return;
         console.error('Camera access error:', err);
@@ -487,6 +642,9 @@ window.resetReceiver = function() {
     stopReceiverCamera();
     decoder.reset();
     lastDecodedBytes = null;
+    rx = null;
+    completedTransferId = null;
+    report('rx-reset');
     document.getElementById('recv-bar').style.width = '0%';
     document.getElementById('recv-pct').innerText = '0%';
     document.getElementById('recv-chunks').innerText = 'Blocks: 0 / 0';
@@ -512,64 +670,347 @@ window.resetReceiver = function() {
     initCamera();
 };
 
-async function scanVideoFrame() {
-    if (!isScanning) return;
+// Scanning runs once per new camera frame (requestVideoFrameCallback; animation frames as a
+// fallback). With the built-in scanner, up to MAX_SCANS_IN_FLIGHT scans overlap: a phone's
+// detector works off the main thread, so a second scan can start while the first is still
+// searching. Results may finish out of order, which the fountain code doesn't mind.
+// Add ?scans=N to the address to try other values (1 = one at a time).
+const MAX_SCANS_IN_FLIGHT = (() => {
+    const n = parseInt(new URLSearchParams(location.search).get('scans'), 10);
+    return n >= 1 && n <= 6 ? n : 2;
+})();
+// Add ?scanpx=N to shrink the centre square to N×N pixels before scanning (fewer pixels,
+// faster scans, but small codes may stop reading). Default: scan it at camera resolution.
+const SCAN_PX = (() => {
+    const n = parseInt(new URLSearchParams(location.search).get('scanpx'), 10);
+    return n >= 160 && n <= 2160 ? n : null;
+})();
+let receiverAnimKind = 'raf';
+let presentedFrames = null;   // camera frame counter from requestVideoFrameCallback
+let cameraFramesInWindow = 0;
+let scansInFlight = 0;
 
+function scheduleScan() {
     const video = document.getElementById('camera-video');
-    if (video && video.readyState === video.HAVE_ENOUGH_DATA) {
-        frameCount++;
-        const now = performance.now();
-        if (now - lastFpsTime >= 1000) {
-            const currentFps = Math.round((frameCount * 1000) / (now - lastFpsTime));
-            document.getElementById('recv-fps').innerText = `Scanning at ${currentFps} FPS`;
-            frameCount = 0;
-            lastFpsTime = now;
-        }
-
-        let rawQrText = null;
-
-        if (barcodeDetector) {
-            try {
-                const barcodes = await barcodeDetector.detect(video);
-                if (barcodes.length > 0) {
-                    rawQrText = barcodes[0].rawValue;
-                }
-            } catch (err) {
-                // fall through to jsQR
+    if (video && 'requestVideoFrameCallback' in video) {
+        receiverAnimKind = 'video';
+        receiverAnimId = video.requestVideoFrameCallback((now, meta) => {
+            if (presentedFrames !== null && meta && meta.presentedFrames > presentedFrames) {
+                cameraFramesInWindow += meta.presentedFrames - presentedFrames;
             }
-        }
+            if (meta) presentedFrames = meta.presentedFrames;
+            onScanTick();
+        });
+    } else {
+        receiverAnimKind = 'raf';
+        receiverAnimId = requestAnimationFrame(() => onScanTick());
+    }
+}
 
-        if (!rawQrText && window.jsQR) {
-            offscreenCanvas.width = video.videoWidth;
-            offscreenCanvas.height = video.videoHeight;
-            offscreenCtx.drawImage(video, 0, 0, offscreenCanvas.width, offscreenCanvas.height);
-            const imageData = offscreenCtx.getImageData(0, 0, offscreenCanvas.width, offscreenCanvas.height);
-            const code = jsQR(imageData.data, imageData.width, imageData.height, {
-                inversionAttempts: 'dontInvert'
-            });
-            if (code) {
-                rawQrText = code.data;
-            }
-        }
+function cancelScan() {
+    if (!receiverAnimId) return;
+    const video = document.getElementById('camera-video');
+    if (receiverAnimKind === 'video' && video && 'cancelVideoFrameCallback' in video) {
+        video.cancelVideoFrameCallback(receiverAnimId);
+    } else {
+        cancelAnimationFrame(receiverAnimId);
+    }
+    receiverAnimId = null;
+}
 
-        if (rawQrText) {
-            await handleDecodedQR(rawQrText);
+// The camera view shows the centre square of the video (object-fit: cover in a square card),
+// so only that square is scanned: what you see is what gets read, with fewer pixels to search.
+function centreSquare(video) {
+    const w = video.videoWidth, h = video.videoHeight;
+    const side = Math.min(w, h);
+    return { sx: (w - side) >> 1, sy: (h - side) >> 1, side };
+}
+
+async function detectWithBuiltIn(video) {
+    const { sx, sy, side } = centreSquare(video);
+    let source = video;
+    let bitmap = null;
+    if (window.createImageBitmap) {
+        try {
+            bitmap = SCAN_PX && SCAN_PX < side
+                ? await createImageBitmap(video, sx, sy, side, side, { resizeWidth: SCAN_PX, resizeHeight: SCAN_PX, resizeQuality: 'medium' })
+                : await createImageBitmap(video, sx, sy, side, side);
+            source = bitmap;
+        } catch (e) {
+            source = video;
         }
     }
+    try {
+        const barcodes = await barcodeDetector.detect(source);
+        if (!barcodes.length) return null;
+        // How wide the code appeared, in camera pixels: tells how far the image can shrink
+        const box = barcodes[0].boundingBox;
+        if (box && box.width) {
+            const scale = source === video ? 1 : side / (SCAN_PX && SCAN_PX < side ? SCAN_PX : side);
+            scanWindow.codePx = Math.round(Math.max(box.width, box.height) * scale);
+        }
+        return barcodes[0].rawValue;
+    } catch (err) {
+        return null;
+    } finally {
+        if (bitmap && bitmap.close) bitmap.close();
+    }
+}
 
-    // Only queue next frame if actively scanning
-    if (isScanning) {
-        receiverAnimId = requestAnimationFrame(scanVideoFrame);
+function detectWithJsQR(video) {
+    const { sx, sy, side } = centreSquare(video);
+    const out = SCAN_PX && SCAN_PX < side ? SCAN_PX : side;
+    offscreenCanvas.width = out;
+    offscreenCanvas.height = out;
+    offscreenCtx.drawImage(video, sx, sy, side, side, 0, 0, out, out);
+    const imageData = offscreenCtx.getImageData(0, 0, out, out);
+    const code = jsQR(imageData.data, out, out, { inversionAttempts: 'dontInvert' });
+    return code ? code.data : null;
+}
+
+function reportScanWindow(video, now) {
+    const windowSec = (now - lastFpsTime) / 1000;
+    document.getElementById('recv-fps').innerText = `Scanning at ${Math.round(frameCount / windowSec)} FPS`;
+    report('rx-tick', {
+        scansPerSec: +(frameCount / windowSec).toFixed(1),
+        cameraFps: receiverAnimKind === 'video' ? +(cameraFramesInWindow / windowSec).toFixed(1) : null,
+        codesPerSec: +(scanWindow.codes / windowSec).toFixed(1),
+        newFramesPerSec: +(scanWindow.newFrames / windowSec).toFixed(1),
+        detectorHits: scanWindow.detectorHits,
+        jsqrHits: scanWindow.jsqrHits,
+        jsqrRuns: scanWindow.jsqrRuns,
+        avgScanMs: scanWindow.done ? +(scanWindow.ms / scanWindow.done).toFixed(1) : null,
+        maxInFlight: scanWindow.maxInFlight,
+        codePx: scanWindow.codePx || null,
+        parallel: barcodeDetector ? MAX_SCANS_IN_FLIGHT : 1,
+        transferId: decoder.transferId,
+        solved: decoder.solvedCount,
+        K: decoder.K,
+        framesRead: decoder.receivedCount,
+        video: `${video.videoWidth}x${video.videoHeight}`,
+        scanned: Math.min(centreSquare(video).side, SCAN_PX || Infinity),
+        loop: receiverAnimKind,
+    });
+    frameCount = 0;
+    cameraFramesInWindow = 0;
+    lastFpsTime = now;
+    scanWindow = { codes: 0, newFrames: 0, detectorHits: 0, jsqrHits: 0, jsqrRuns: 0, ms: 0, done: 0, maxInFlight: 0, codePx: 0 };
+}
+
+// Called once per new camera frame: report each second, start a scan if a slot is free.
+function onScanTick() {
+    if (!isScanning) return;
+    const video = document.getElementById('camera-video');
+    if (video && video.readyState >= video.HAVE_CURRENT_DATA && video.videoWidth) {
+        const now = performance.now();
+        if (now - lastFpsTime >= 1000) reportScanWindow(video, now);
+        // jsQR runs on the main thread, so overlapping it gains nothing; one at a time there
+        const limit = barcodeDetector && receiverAnimKind === 'video' ? MAX_SCANS_IN_FLIGHT : 1;
+        if (scansInFlight < limit && !cardBusy) runScan(video);
+    }
+    if (isScanning) scheduleScan();
+}
+
+async function runScan(video) {
+    scansInFlight++;
+    scanWindow.maxInFlight = Math.max(scanWindow.maxInFlight, scansInFlight);
+    frameCount++;
+    totalScans++;
+    const start = performance.now();
+    try {
+        // The built-in scanner when the browser has one; jsQR only when it doesn't.
+        // (Running jsQR after every built-in miss cost ~300 ms a scan on a real phone.)
+        let rawQrText = null;
+        if (barcodeDetector) {
+            rawQrText = await detectWithBuiltIn(video);
+            if (rawQrText) scanWindow.detectorHits++;
+        } else if (window.jsQR) {
+            scanWindow.jsqrRuns++;
+            rawQrText = detectWithJsQR(video);
+            if (rawQrText) scanWindow.jsqrHits++;
+        }
+        if (rawQrText && isScanning) {
+            scanWindow.codes++;
+            const before = decoder.receivedCount;
+            await handleDecodedQR(rawQrText);
+            if (decoder.receivedCount > before) scanWindow.newFrames++;
+        }
+    } finally {
+        scanWindow.ms += performance.now() - start;
+        scanWindow.done++;
+        scansInFlight--;
     }
 }
 
 let lastDecodedBytes = null;
 
+// --- Transfer measurement (receiver) ---
+// A transfer is timed from the first frame read to the moment the last block is solved.
+// Droplet ids are the sender's frame counter, so the id span tells how many frames the
+// sender showed meanwhile: that gives the sender's frame rate and how many the camera caught.
+let rx = null;              // { transferId, start, doneAt, minId, maxId, scansAtStart, scansAtEnd }
+let totalScans = 0;         // camera frames examined since the page loaded
+// Per-second scan counters, reported as rx-tick
+let scanWindow = { codes: 0, newFrames: 0, detectorHits: 0, jsqrHits: 0, jsqrRuns: 0, ms: 0, done: 0, maxInFlight: 0, codePx: 0 };
+let completedTransferId = null;
+const LOG_STORAGE_KEY = 'rapidfire.testLog';
+const LOG_LIMIT = 50;
+
+function trackFrame(header, now) {
+    if (!rx || rx.transferId !== header.transferId) {
+        rx = {
+            transferId: header.transferId, start: now, doneAt: null,
+            minId: header.dropletId, maxId: header.dropletId,
+            scansAtStart: totalScans, scansAtEnd: null,
+            seen: new Set(), points: [],
+        };
+    }
+    if (rx.doneAt !== null || rx.seen.has(header.dropletId)) return;
+    rx.seen.add(header.dropletId);
+    rx.points.push([now, header.dropletId]);
+    rx.minId = Math.min(rx.minId, header.dropletId);
+    rx.maxId = Math.max(rx.maxId, header.dropletId);
+}
+
+// Sender frame rate = slope of frame id over the time each id was first read (least squares).
+// Fitting every read frame smooths out camera start-up delay and scan jitter.
+function estimateSenderFps(points) {
+    if (points.length < 3) return null;
+    const n = points.length;
+    let st = 0, si = 0;
+    for (const [t, i] of points) { st += t; si += i; }
+    const mt = st / n, mi = si / n;
+    let num = 0, den = 0;
+    for (const [t, i] of points) { num += (t - mt) * (i - mi); den += (t - mt) * (t - mt); }
+    if (den <= 0 || num <= 0) return null;
+    return (num / den) * 1000;
+}
+
+function measureTransfer({ bytes, sentBytes, compressed, verified }) {
+    const active = (rx.doneAt - rx.start) / 1000;
+    const senderFps = estimateSenderFps(rx.points);
+    const framesShown = rx.maxId - rx.minId + 1;
+    // Transfer time = how long the sender took to show the frames this transfer needed
+    const seconds = senderFps ? framesShown / senderFps : null;
+    return {
+        at: new Date().toISOString(),
+        bytes, sentBytes, compressed, verified,
+        blocks: decoder.K,
+        chunk: decoder.chunkSize,
+        seconds,
+        senderFps,
+        framesRead: decoder.receivedCount,
+        framesShown,
+        caughtPct: Math.min(100, Math.round((100 * decoder.receivedCount) / framesShown)),
+        scanFps: active > 0 ? (rx.scansAtEnd - rx.scansAtStart) / active : null,
+        speed: seconds ? bytes / seconds : null,
+        wireSpeed: seconds ? sentBytes / seconds : null,
+    };
+}
+
+function rate(bytesPerSecond) {
+    return bytesPerSecond === null ? '—' : `${formatBytes(Math.round(bytesPerSecond))}/s`;
+}
+
+function renderTransferStats(m) {
+    const box = document.getElementById('transfer-stats');
+    if (!box) return;
+    const ratio = m.compressed ? `compressed ${(m.bytes / m.sentBytes).toFixed(1)}×` : 'not compressed';
+    const rows = [
+        ['Integrity', m.verified ? 'Verified: every byte matches' : 'Checksum mismatch: data is damaged', m.verified ? 'ok' : 'bad'],
+        ['Content', `${formatBytes(m.bytes)} · sent ${formatBytes(m.sentBytes)} (${ratio})`],
+        ['Time', m.seconds === null ? 'too few frames to time' : `${m.seconds.toFixed(1)} s`],
+        ['Speed', `${rate(m.speed)} content · ${rate(m.wireSpeed)} over the air`],
+        ['Sender', `${m.senderFps === null ? '—' : m.senderFps.toFixed(1) + ' fps'} · ${m.chunk} B per frame`],
+        ['Frames', `${m.framesRead} read for ${m.blocks} blocks · camera caught ${m.caughtPct}% of ${m.framesShown}`],
+        ['Scanner', m.scanFps === null ? '—' : `${m.scanFps.toFixed(0)} scans/s`],
+    ];
+    box.replaceChildren(...rows.map(([label, value, tone]) => {
+        const row = document.createElement('div');
+        row.className = 'stat-row';
+        const l = document.createElement('span');
+        l.className = 'stat-label';
+        l.textContent = label;
+        const v = document.createElement('span');
+        v.className = 'stat-value' + (tone ? ` stat-${tone}` : '');
+        v.textContent = value;
+        row.append(l, v);
+        return row;
+    }));
+}
+
+// --- Test log (receiver, kept on this device) ---
+function loadLog() {
+    try { return JSON.parse(localStorage.getItem(LOG_STORAGE_KEY)) || []; } catch (e) { return []; }
+}
+
+function saveLog(log) {
+    try { localStorage.setItem(LOG_STORAGE_KEY, JSON.stringify(log.slice(-LOG_LIMIT))); } catch (e) {}
+}
+
+const LOG_COLUMNS = [
+    ['time', m => new Date(m.at).toLocaleTimeString()],
+    ['ok', m => (m.verified ? 'yes' : 'NO')],
+    ['content', m => formatBytes(m.bytes)],
+    ['sent', m => formatBytes(m.sentBytes)],
+    ['seconds', m => (m.seconds === null ? '' : m.seconds.toFixed(1))],
+    ['speed', m => rate(m.speed)],
+    ['air', m => rate(m.wireSpeed)],
+    ['fps', m => (m.senderFps === null ? '' : m.senderFps.toFixed(1))],
+    ['B/frame', m => String(m.chunk)],
+    ['caught', m => `${m.caughtPct}%`],
+    ['read/blocks', m => `${m.framesRead}/${m.blocks}`],
+    ['scans/s', m => (m.scanFps === null ? '' : m.scanFps.toFixed(0))],
+];
+
+function renderLog() {
+    const card = document.getElementById('test-log-card');
+    const body = document.getElementById('test-log-body');
+    if (!card || !body) return;
+    const log = loadLog();
+    card.style.display = log.length ? 'flex' : 'none';
+    const table = document.createElement('table');
+    const head = table.createTHead().insertRow();
+    for (const [name] of LOG_COLUMNS) {
+        const th = document.createElement('th');
+        th.textContent = name;
+        head.appendChild(th);
+    }
+    const tbody = table.createTBody();
+    for (const m of log.slice().reverse()) {
+        const tr = tbody.insertRow();
+        if (!m.verified) tr.className = 'log-bad';
+        for (const [, fmt] of LOG_COLUMNS) tr.insertCell().textContent = fmt(m);
+    }
+    body.replaceChildren(table);
+}
+
+window.copyTestLog = async function() {
+    const log = loadLog();
+    const lines = [LOG_COLUMNS.map(([name]) => name).join('\t')]
+        .concat(log.map(m => LOG_COLUMNS.map(([, fmt]) => fmt(m)).join('\t')));
+    try {
+        await navigator.clipboard.writeText(lines.join('\n'));
+        const btn = document.getElementById('btn-copy-log');
+        if (btn) {
+            btn.innerText = 'Copied';
+            setTimeout(() => { btn.innerText = 'Copy'; }, 2000);
+        }
+    } catch (e) {
+        console.warn('Copy failed', e);
+    }
+};
+
+window.clearTestLog = function() {
+    saveLog([]);
+    renderLog();
+};
+
 async function handleDecodedQR(data) {
     // If it's an ACK QR and we are in sender mode
     if (data.startsWith('ACK:')) {
         if (isSending) {
-            stopSending();
+            stopSending('ack');
             document.getElementById('beam-stats').innerText = 'Receiver confirmed. Beaming finished.';
             if ('vibrate' in navigator) {
                 navigator.vibrate([30, 40, 30]);
@@ -579,17 +1020,19 @@ async function handleDecodedQR(data) {
     }
 
     // Droplet QR
-    if (data.startsWith('F:')) {
-        const b64 = data.substring(2);
+    if (data.startsWith(PACKET_PREFIX)) {
         try {
-            const packetBytes = base64ToUint8(b64);
-            if (packetBytes.length >= 12) {
-                const incomingTransferId = new DataView(packetBytes.buffer, packetBytes.byteOffset, packetBytes.byteLength).getUint16(0, false);
-                // If a new transfer has arrived and we already had a completed state, reset receiver state
-                if (decoder.transferId !== null && decoder.transferId !== incomingTransferId) {
-                    lastDecodedBytes = null;
-                    document.getElementById('result-box').style.display = 'none';
-                }
+            const now = performance.now();
+            const packetBytes = base45Decode(data.substring(PACKET_PREFIX.length));
+            const header = packetBytes && readHeader(packetBytes);
+            if (!header) return;
+            // A scan still in flight when the transfer finished: nothing left to do
+            if (completedTransferId === header.transferId) return;
+            trackFrame(header, now);
+            // If a new transfer has arrived and we already had a completed state, reset receiver state
+            if (decoder.transferId !== null && decoder.transferId !== header.transferId) {
+                lastDecodedBytes = null;
+                document.getElementById('result-box').style.display = 'none';
             }
 
             const accepted = decoder.addDroplet(packetBytes);
@@ -599,27 +1042,44 @@ async function handleDecodedQR(data) {
                 document.getElementById('recv-bar').style.width = `${pct}%`;
                 document.getElementById('recv-pct').innerText = `${pct}%`;
                 document.getElementById('recv-chunks').innerText = `Blocks: ${decoder.solvedCount} / ${decoder.K || '?'}`;
-                document.getElementById('recv-status').innerText = `Reconstructing payload (${decoder.equations.length} buffered)`;
+                document.getElementById('recv-status').innerText = `Reconstructing payload (${decoder.receivedCount} frames read)`;
 
                 // Subtle haptic tick on mobile when a packet contributes
                 if (accepted && 'vibrate' in navigator) {
                     navigator.vibrate(8);
                 }
 
-                if (decoder.isDone && !lastDecodedBytes) {
+                if (decoder.isDone && completedTransferId !== decoder.transferId) {
+                    completedTransferId = decoder.transferId;
+                    rx.doneAt = now;
+                    rx.scansAtEnd = totalScans;
                     onTransferComplete();
                 }
             }
         } catch (e) {
             console.error('Failed to parse packet', e);
         }
+        return;
+    }
+
+    if (LEGACY_PREFIX.test(data)) {
+        document.getElementById('recv-status').innerText = 'The sender runs an older RapidFireQR. Reload it to update.';
     }
 }
 
 async function onTransferComplete() {
-    const rawCompressed = decoder.getRecoveredData();
-    const decompressed = await decompressData(rawCompressed);
+    const packed = decoder.getRecoveredData();
+    const { bytes: decompressed, compressed, verified } = await unpackPayload(packed);
     lastDecodedBytes = decompressed;
+    const rawCompressed = packed;
+
+    const measurement = measureTransfer({ bytes: decompressed.length, sentBytes: packed.length, compressed, verified });
+    renderTransferStats(measurement);
+    report('rx-done', { transferId: decoder.transferId, ...measurement });
+    const log = loadLog();
+    log.push(measurement);
+    saveLog(log);
+    renderLog();
 
     document.getElementById('recv-status').innerText = 'Payload reconstruction complete';
     document.getElementById('result-box').style.display = 'flex';
@@ -714,12 +1174,820 @@ window.switchTab = function(screen) {
             initCamera();
         }
     }
+    labState();
 };
 
 // Initialize
 window.addEventListener('DOMContentLoaded', () => {
-    // Check PWA service worker
-    if ('serviceWorker' in navigator) {
+    syncSizeButtons();
+    renderLog();
+
+    // Check PWA service worker (off under the lab remote, so every reload gets fresh files)
+    if (LAB_REMOTE) {
+        startLabRemote();
+    } else if ('serviceWorker' in navigator) {
         navigator.serviceWorker.register('sw.js').catch(console.warn);
     }
 });
+
+
+// =====================================================================================
+// Density test card (lab): the sender shows a grid of known pseudo-random squares; the receiver
+// counts how many it misreads. See card.js.
+// =====================================================================================
+function cardStatus() {
+    if (!cardRun) return { running: false };
+    const c = cardRun;
+    return { running: true, k: c.k, fps: c.fps, grid: c.N, levels: c.L, seed: c.seed, greys: c.greys,
+        screenPxPerSquare: c.cssPerModule, devicePxPerSquare: c.devPerModule };
+}
+
+function drawCard() {
+    const c = cardRun;
+    paintCard(c.img, c.layout, c.L, c.seed, c.k, c.greys, performance.now() < c.blankUntil);
+    c.offCtx.putImageData(c.img, 0, 0);
+    const container = frameCanvas.parentElement;
+    const cs = getComputedStyle(container);
+    const availW = container.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    const availH = container.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    const dpr = window.devicePixelRatio || 1;
+    const quiet = 2;
+    const span = c.N + quiet * 2;
+    const scale = Math.max(1, Math.floor(Math.min(availW, availH) * dpr / span));
+    const px = span * scale;
+    if (frameCanvas.width !== px) {
+        frameCanvas.width = px;
+        frameCanvas.height = px;
+        frameCanvas.style.width = `${px / dpr}px`;
+        frameCanvas.style.height = `${px / dpr}px`;
+    }
+    const ctx = frameCtx;
+    ctx.imageSmoothingEnabled = false;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, px, px);
+    ctx.drawImage(c.off, quiet * scale, quiet * scale, c.N * scale, c.N * scale);
+    c.devPerModule = scale;
+    c.cssPerModule = scale / dpr;
+    document.getElementById('beam-stats').innerText = `Test card ${c.N}×${c.N} · ${c.L} levels · frame ${c.k} · ${c.fps} fps`;
+}
+
+function startCard({ N, L, fps, seed, greys, blank = 1.5 }) {
+    if (currentTab() !== 'send') switchTab('send');
+    document.getElementById('screen-send').classList.add('is-beaming');
+    setupFrameCanvas();
+    const off = document.createElement('canvas');
+    off.width = N;
+    off.height = N;
+    const offCtx = off.getContext('2d');
+    cardRun = { N, L, fps, seed, greys, k: 0, layout: cardLayout(N), off, offCtx, img: offCtx.createImageData(N, N), rafId: null,
+        blankUntil: performance.now() + blank * 1000 };
+    let last = -Infinity;
+    const tick = (now) => {
+        if (!cardRun) return;
+        const interval = 1000 / cardRun.fps;
+        if (now - last >= interval - 4) {
+            last = now - last < interval * 2 ? last + interval : now;
+            drawCard();
+            cardRun.k++;
+        }
+        cardRun.rafId = requestAnimationFrame(tick);
+    };
+    drawCard();
+    cardRun.k++;
+    last = performance.now();
+    cardRun.rafId = requestAnimationFrame(tick);
+    report('card-start', { grid: N, levels: L, fps, seed, devPerModule: cardRun.devPerModule });
+}
+
+function stopCard() {
+    const c = cardRun;
+    if (!c) return null;
+    cancelAnimationFrame(c.rafId);
+    cardRun = null;
+    frameCanvas = null;
+    frameCtx = null;
+    document.getElementById('screen-send').classList.remove('is-beaming');
+    renderPlaceholder();
+    document.getElementById('beam-stats').innerText = 'Stream standby';
+    return { framesShown: c.k };
+}
+
+function nextVideoFrame(video) {
+    return new Promise(resolve => {
+        if ('requestVideoFrameCallback' in video) video.requestVideoFrameCallback((now, meta) => resolve(meta));
+        else requestAnimationFrame(() => resolve(null));
+    });
+}
+
+async function measureCard({ grid = 101, levels = 2, seed = 1, k0 = 0, fps = 4, seconds = 6, rate = 6 } = {}) {
+    if (currentTab() !== 'recv') switchTab('recv');
+    if (!isScanning) { await initCamera(); await waitFor(800); }
+    const video = document.getElementById('camera-video');
+    if (!video.videoWidth) throw new Error('camera is off');
+    cardBusy = true;
+    const an = new CardAnalyzer({ N: grid, L: levels, seed });
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const s = { pictures: 0, located: 0, lostLocate: 0, notFound: 0, torn: 0, blended: 0, clean: 0,
+        ser: [], serClean: [], berClean: [], r: [], kSeen: new Set(), ms: 0,
+        lvSum: new Float64Array(levels), lvSq: new Float64Array(levels), lvN: 0 };
+    const t0 = performance.now();
+    let lastGrab = 0, lastLocate = -Infinity, lastK = k0;
+    try {
+        while (performance.now() - t0 < seconds * 1000) {
+            await nextVideoFrame(video);
+            const now = performance.now();
+            if (now - lastGrab < 1000 / rate) continue;
+            lastGrab = now;
+            const W = video.videoWidth, H = video.videoHeight;
+            if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+            ctx.drawImage(video, 0, 0, W, H);
+            const img = ctx.getImageData(0, 0, W, H);
+            const a0 = performance.now();
+            s.pictures++;
+            // Lock on once (during the sender's blank frames), then keep that lock: the phone and
+            // screen don't move. If a picture doesn't match the fixed squares, try to re-lock, but
+            // keep the old lock if that fails (data frames are much harder to lock on to).
+            if (!an.positions) {
+                if (!an.locate(img)) { s.lostLocate++; continue; }
+                s.located++;
+            } else if (!an.stillLocated(img)) {
+                const saved = { positions: an.positions, map: an.map, modulePx: an.modulePx, corners: an.corners };
+                if (an.locate(img)) s.located++;
+                else Object.assign(an, saved);
+            }
+            const kExp = k0 + ((now - t0) / 1000) * fps;
+            const from = Math.max(0, Math.floor(Math.min(lastK, kExp)) - 2);
+            const to = Math.ceil(kExp + fps * 0.7 + 3);
+            const candidates = [];
+            for (let k = from; k <= to; k++) candidates.push(k);
+            const res = an.analyze(img, candidates);
+            s.ms += performance.now() - a0;
+            if (!res.found) { s.notFound++; continue; }
+            lastK = res.k;
+            s.kSeen.add(res.k);
+            s.r.push(res.r);
+            s.ser.push(res.ser);
+            const blended = res.second > 0.25;
+            if (res.torn) s.torn++;
+            if (blended) s.blended++;
+            if (!res.torn && !blended) {
+                s.clean++;
+                s.serClean.push(res.ser);
+                s.berClean.push(res.ber);
+                res.levels.forEach((l, v) => { s.lvSum[v] += l.mean; s.lvSq[v] += l.sd; });
+                s.lvN++;
+            }
+        }
+    } finally {
+        cardBusy = false;
+    }
+    const median = a => { if (!a.length) return null; const b = [...a].sort((x, y) => x - y); return b[b.length >> 1]; };
+    const mean = a => (a.length ? a.reduce((x, y) => x + y, 0) / a.length : null);
+    const levelsOut = s.lvN ? Array.from({ length: levels }, (_, v) => ({ mean: +(s.lvSum[v] / s.lvN).toFixed(1), sd: +(s.lvSq[v] / s.lvN).toFixed(1) })) : null;
+    let separation = null;
+    if (levelsOut) {
+        separation = Infinity;
+        for (let v = 1; v < levels; v++) separation = Math.min(separation, (levelsOut[v].mean - levelsOut[v - 1].mean) / (levelsOut[v].sd + levelsOut[v - 1].sd));
+        separation = +separation.toFixed(2);
+    }
+    const analysed = s.pictures - s.lostLocate - s.notFound;
+    const summary = {
+        grid, levels, fps, seconds,
+        camera: `${video.videoWidth}x${video.videoHeight}`,
+        cameraPxPerSquare: an.modulePx ? +an.modulePx.toFixed(2) : null,
+        corners: an.corners || null,
+        pictures: s.pictures, analysed, notLocated: s.lostLocate, notMatched: s.notFound, lockOns: s.located,
+        distinctFrames: s.kSeen.size,
+        cleanPct: analysed ? Math.round((100 * s.clean) / analysed) : 0,
+        tornPct: analysed ? Math.round((100 * s.torn) / analysed) : 0,
+        blendedPct: analysed ? Math.round((100 * s.blended) / analysed) : 0,
+        serCleanMedian: median(s.serClean), serCleanMean: mean(s.serClean),
+        berCleanMedian: median(s.berClean),
+        serAllMedian: median(s.ser),
+        corrMedian: median(s.r),
+        levelStats: levelsOut, separation,
+        analysisMs: analysed ? Math.round(s.ms / analysed) : null,
+    };
+    for (const k of ['serCleanMedian', 'serCleanMean', 'berCleanMedian', 'serAllMedian', 'corrMedian']) {
+        if (summary[k] !== null) summary[k] = +summary[k].toFixed(4);
+    }
+    report('card-result', summary);
+    return summary;
+}
+
+// =====================================================================================
+// RapidFire code v1 (lab): dense black-and-white frames, one fountain packet per band (rfc.js)
+// =====================================================================================
+function blitGrid(off, N) {
+    const container = frameCanvas.parentElement;
+    const cs = getComputedStyle(container);
+    const availW = container.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    const availH = container.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+    const dpr = window.devicePixelRatio || 1;
+    const quiet = 2, span = N + quiet * 2;
+    const scale = Math.max(1, Math.floor(Math.min(availW, availH) * dpr / span));
+    const px = span * scale;
+    if (frameCanvas.width !== px) {
+        frameCanvas.width = px;
+        frameCanvas.height = px;
+        frameCanvas.style.width = `${px / dpr}px`;
+        frameCanvas.style.height = `${px / dpr}px`;
+    }
+    frameCtx.imageSmoothingEnabled = false;
+    frameCtx.fillStyle = '#ffffff';
+    frameCtx.fillRect(0, 0, px, px);
+    frameCtx.drawImage(off, quiet * scale, quiet * scale, N * scale, N * scale);
+    return scale;
+}
+
+async function startRfc({ kb = 50, fps = 10, grid = 249, bands = 8, ecc = 16, levels = 2, greys = null, blank = 1.5, blankEvery = 45, text } = {}) {
+    if (isSending) stopSending('lab');
+    if (cardRun) stopCard();
+    if (rfcRun) stopRfc();
+    const rfc = rfcPlan(grid, bands, ecc, levels);
+    if (text === undefined) {
+        const words = [];
+        let size = 0;
+        while (size < kb * 1024) {
+            const w = Math.random().toString(36).slice(2, 3 + Math.floor(Math.random() * 8));
+            words.push(w);
+            size += w.length + 1;
+        }
+        text = words.join(' ');
+    }
+    const bytes = new TextEncoder().encode(text);
+    const { packed, compressed } = await packPayload(bytes);
+    const enc = new FountainEncoder(packed, rfc.packetBytes - HEADER_BYTES);
+    if (currentTab() !== 'send') switchTab('send');
+    document.getElementById('screen-send').classList.add('is-beaming');
+    setupFrameCanvas();
+    const off = document.createElement('canvas');
+    off.width = grid;
+    off.height = grid;
+    const offCtx = off.getContext('2d');
+    const img = offCtx.createImageData(grid, grid);
+    rfcRun = { rfc, enc, fps, off, offCtx, img, frame: 0, blankUntil: performance.now() + blank * 1000, blankEvery, rafId: null, startedAt: performance.now() };
+    const draw = () => {
+        const r = rfcRun;
+        const isBlank = performance.now() < r.blankUntil || (r.blankEvery && r.frame % r.blankEvery === 0);
+        paintFrame(r.img, r.rfc, isBlank ? null : buildFrame(r.rfc, Array.from({ length: r.rfc.bands }, () => r.enc.nextDroplet())), greys);
+        r.offCtx.putImageData(r.img, 0, 0);
+        r.scale = blitGrid(r.off, r.rfc.N);
+        r.frame++;
+        document.getElementById('beam-stats').innerText = `RapidFire v1 ${grid}×${grid} · frame ${r.frame} · ${r.enc.K} blocks · ${fps} fps`;
+    };
+    let last = -Infinity;
+    const tick = (now) => {
+        if (!rfcRun) return;
+        const interval = 1000 / rfcRun.fps;
+        if (now - last >= interval - 4) {
+            last = now - last < interval * 2 ? last + interval : now;
+            draw();
+        }
+        rfcRun.rafId = requestAnimationFrame(tick);
+    };
+    rfcRun.rafId = requestAnimationFrame(tick);
+    const info = { transferId: enc.transferId, K: enc.K, chunk: enc.chunkSize, packetBytes: rfc.packetBytes, perFrame: rfc.packetBytes * bands, bytes: bytes.length, sentBytes: packed.length, compressed, grid, bands, ecc, levels, fps };
+    report('rfc-start', info);
+    return info;
+}
+
+function stopRfc() {
+    const r = rfcRun;
+    if (!r) return null;
+    cancelAnimationFrame(r.rafId);
+    rfcRun = null;
+    frameCanvas = null;
+    frameCtx = null;
+    document.getElementById('screen-send').classList.remove('is-beaming');
+    renderPlaceholder();
+    document.getElementById('beam-stats').innerText = 'Stream standby';
+    return { frames: r.frame, seconds: +((performance.now() - r.startedAt) / 1000).toFixed(2) };
+}
+
+async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds = 30, gpu = false, frames = true } = {}) {
+    if (currentTab() !== 'recv') switchTab('recv');
+    if (!isScanning) { await initCamera(); await waitFor(800); }
+    const video = document.getElementById('camera-video');
+    if (!video.videoWidth) throw new Error('camera is off');
+    cardBusy = true;
+    const rfc = rfcPlan(grid, bands, ecc, levels);
+    const an = new CardAnalyzer({ N: grid, L: 2, seed: 0 });
+    const dec = new FountainDecoder();
+    const rsDecode = window.jsQR.internals.rsDecode;
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d', { willReadFrequently: true });
+    const s = { pictures: 0, lockOns: 0, unlocked: 0, relocks: 0, bandsOk: 0, bandsBad: 0, grabMs: 0, decodeMs: 0, idleMs: 0, skipped: 0, badByBand: [], firstGood: null, done: null };
+    let crop = null, badStreak = 0, sampler = null, gpuCheck = null, yBuf = null, useFrames = frames && typeof VideoFrame !== 'undefined';
+    let reader = null, readerTrack = null;
+    const t0 = performance.now();
+    // Ask for the next camera frame before processing the current one, so a frame that
+    // arrives while we're busy is waiting for us instead of being skipped
+    let pending = nextVideoFrame(video);
+    try {
+        let lastPresented = null, lastWorkEnd = null, lastTs = null;
+        while (performance.now() - t0 < seconds * 1000 && !dec.isDone) {
+            // Once locked on, read frames straight from the camera track: they arrive as the
+            // camera makes them, not on the screen's repaint schedule (which cost ~17 ms a frame)
+            let trackFrame = null;
+            if (an.positions && useFrames && typeof MediaStreamTrackProcessor !== 'undefined') {
+                if (!reader) {
+                    readerTrack = video.srcObject.getVideoTracks()[0].clone();
+                    reader = new MediaStreamTrackProcessor({ track: readerTrack, maxBufferSize: 1 }).readable.getReader();
+                }
+                const { value, done } = await reader.read();
+                if (done) break;
+                trackFrame = value;
+                if (lastTs !== null) s.skipped += Math.max(0, Math.round((value.timestamp - lastTs) / 33333) - 1);
+                lastTs = value.timestamp;
+            } else {
+                const meta = await pending;
+                pending = nextVideoFrame(video);
+                if (meta && lastPresented !== null) s.skipped += Math.max(0, meta.presentedFrames - lastPresented - 1);
+                if (meta) lastPresented = meta.presentedFrames;
+            }
+            const g0 = performance.now();
+            if (lastWorkEnd !== null) s.idleMs += g0 - lastWorkEnd;
+            s.pictures++;
+            let img, ox = 0, oy = 0;
+            if (!an.positions) {
+                // not locked on yet: grab the whole picture and look for the card
+                const W = video.videoWidth, H = video.videoHeight;
+                if (canvas.width !== W || canvas.height !== H) { canvas.width = W; canvas.height = H; }
+                ctx.drawImage(video, 0, 0, W, H);
+                img = ctx.getImageData(0, 0, W, H);
+                if (!an.locate(img)) { s.unlocked++; continue; }
+                s.lockOns++;
+                // Prefer the GPU: it reads just the square centres instead of copying the picture
+                sampler = null;
+                if (gpu) {
+                    try {
+                        sampler = new GpuSampler(an.positions);
+                        const a = sampler.sample(video), b = an.sample(img);
+                        let d = 0;
+                        for (let j = 0; j < a.length; j++) d += Math.abs(a[j] - b[j]);
+                        gpuCheck = +(d / a.length).toFixed(2); // average difference from the CPU path
+                    } catch (e) {
+                        sampler = null;
+                        gpuCheck = String(e.message || e);
+                    }
+                }
+                // otherwise grab only the card's bounding box (plus a margin)
+                const xs = an.corners.map(c => c[0]), ys = an.corners.map(c => c[1]);
+                const m = an.modulePx * 4;
+                crop = {
+                    x: Math.max(0, Math.floor(Math.min(...xs) - m)), y: Math.max(0, Math.floor(Math.min(...ys) - m)),
+                };
+                crop.x &= ~1;
+                crop.y &= ~1;
+                crop.w = (Math.min(video.videoWidth, Math.ceil(Math.max(...xs) + m)) - crop.x) & ~1;
+                crop.h = (Math.min(video.videoHeight, Math.ceil(Math.max(...ys) + m)) - crop.y) & ~1;
+            } else if (useFrames) {
+                // VideoFrame: copy just the card region's brightness plane (no colour conversion)
+                img = null;
+            } else if (sampler) {
+                img = null;
+            } else {
+                if (canvas.width !== crop.w || canvas.height !== crop.h) { canvas.width = crop.w; canvas.height = crop.h; }
+                ctx.drawImage(video, crop.x, crop.y, crop.w, crop.h, 0, 0, crop.w, crop.h);
+                img = ctx.getImageData(0, 0, crop.w, crop.h);
+                ox = crop.x;
+                oy = crop.y;
+            }
+            let lum;
+            if (img) {
+                lum = an.sample(img, ox, oy);
+            } else if (useFrames) {
+                const f = trackFrame || new VideoFrame(video);
+                const rect = { x: crop.x, y: crop.y, width: crop.w, height: crop.h };
+                try {
+                    const need = f.allocationSize({ rect });
+                    if (!yBuf || yBuf.length < need) yBuf = new Uint8Array(need); // the region can change after a re-lock
+                    const layout = await f.copyTo(yBuf, { rect });
+                    if (f.format !== 'I420' && f.format !== 'NV12' && f.format !== 'I420A') throw new Error(`frame format ${f.format}`);
+                    lum = an.sampleY(yBuf.subarray(layout[0].offset), layout[0].stride, crop.h, crop.x, crop.y);
+                } catch (e) {
+                    useFrames = false; // fall back to the canvas path from the next picture
+                    trackFrame = null;
+                    gpuCheck = `VideoFrame: ${e.message || e}`;
+                    f.close();
+                    continue;
+                }
+                f.close();
+            } else {
+                lum = sampler.sample(video);
+            }
+            const g1 = performance.now();
+            const bits = threshold(rfc, lum);
+            const packets = readFrame(rfc, bits, rsDecode);
+            let good = 0;
+            packets.forEach((p, b) => { if (!p) s.badByBand[b] = (s.badByBand[b] || 0) + 1; });
+            for (const p of packets) {
+                if (!p) { s.bandsBad++; continue; }
+                s.bandsOk++;
+                good++;
+                if (s.firstGood === null) s.firstGood = performance.now();
+                dec.addDroplet(p);
+            }
+            // A bad lock shows up as picture after picture with no good band: drop it and lock
+            // on again (the sender shows a blank frame every so often for exactly this)
+            badStreak = good ? 0 : badStreak + 1;
+            if (badStreak >= 40) {
+                an.positions = null;
+                an.map = null;
+                badStreak = 0;
+                s.relocks++;
+            }
+            s.grabMs += g1 - g0;
+            s.decodeMs += performance.now() - g1;
+            lastWorkEnd = performance.now();
+        }
+    } finally {
+        cardBusy = false;
+        if (reader) { try { reader.cancel(); } catch (e) {} }
+        if (readerTrack) readerTrack.stop();
+    }
+    s.done = dec.isDone ? performance.now() : null;
+    let verified = false, bytes = 0, compressed = false;
+    if (dec.isDone) {
+        const out = await unpackPayload(dec.getRecoveredData());
+        verified = out.verified;
+        bytes = out.bytes.length;
+        compressed = out.compressed;
+    }
+    const secs = s.done && s.firstGood ? (s.done - s.firstGood) / 1000 : null;
+    const result = {
+        done: dec.isDone, verified, bytes, sentBytes: dec.totalLength, compressed,
+        blocks: dec.K, solved: dec.solvedCount, packetsRead: dec.receivedCount,
+        seconds: secs !== null ? +secs.toFixed(2) : null,
+        speed: secs ? Math.round(bytes / secs) : null,
+        wireSpeed: secs ? Math.round(dec.totalLength / secs) : null,
+        pictures: s.pictures, lockOns: s.lockOns, unlocked: s.unlocked, relocks: s.relocks,
+        bandsOk: s.bandsOk, bandsBad: s.bandsBad,
+        picturesPerSec: +(s.pictures / ((performance.now() - t0) / 1000)).toFixed(1),
+        grabMs: s.pictures ? Math.round(s.grabMs / s.pictures) : null,
+        decodeMs: s.pictures - s.unlocked ? Math.round(s.decodeMs / (s.pictures - s.unlocked)) : null,
+        camera: `${video.videoWidth}x${video.videoHeight}`,
+        squarePx: an.modulePx ? +an.modulePx.toFixed(2) : null,
+        crop: crop ? `${crop.w}x${crop.h}` : null,
+        sampler: useFrames ? 'videoframe' : sampler ? 'gpu' : 'canvas', gpuCheck,
+        badByBand: s.badByBand, cameraFramesSkipped: s.skipped, avgWaitMs: s.pictures ? Math.round(s.idleMs / s.pictures) : null,
+    };
+    report('rfc-done', result);
+    return result;
+}
+
+// =====================================================================================
+// Lab remote: open the page with ?lab=1 on a home-network address and it connects to the
+// lab server, which relays commands sent from the Mac (.lab/ctl.cjs). Results go back to
+// the server; measurements keep flowing as telemetry. Never active on a public host.
+// =====================================================================================
+const LAB_REMOTE = LAB_MODE && new URLSearchParams(location.search).get('lab') === '1';
+const CLIENT_ID = (() => {
+    let tab = null;
+    try {
+        tab = sessionStorage.getItem('rapidfire.tabId');
+        if (!tab) {
+            tab = Math.random().toString(36).slice(2, 6);
+            sessionStorage.setItem('rapidfire.tabId', tab);
+        }
+    } catch (e) {
+        tab = Math.random().toString(36).slice(2, 6);
+    }
+    return `${DEVICE_ID}-${tab}`;
+})();
+let wakeLock = null;
+
+function currentTab() {
+    return document.getElementById('screen-recv').classList.contains('active') ? 'recv' : 'send';
+}
+
+function labState() {
+    if (!LAB_REMOTE) return;
+    const state = {
+        client: CLIENT_ID,
+        role: currentTab() === 'recv' ? 'receiver' : 'sender',
+        tab: currentTab(),
+        sending: isSending,
+        scanning: isScanning,
+        v: APP_VERSION,
+        url: location.href,
+        wakeLock: !!wakeLock,
+    };
+    fetch('/api/state', { method: 'POST', body: JSON.stringify(state), headers: { 'Content-Type': 'application/json' } }).catch(() => {});
+}
+
+async function holdWakeLock() {
+    if (!('wakeLock' in navigator) || document.visibilityState !== 'visible') return;
+    try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; labState(); });
+    } catch (e) {
+        wakeLock = null;
+    }
+    labState();
+}
+
+function videoTrack() {
+    return videoStream ? videoStream.getVideoTracks()[0] : null;
+}
+
+function jsonSafe(value) {
+    return JSON.parse(JSON.stringify(value, (k, v) => (typeof v === 'number' && !isFinite(v) ? String(v) : v)) ?? 'null');
+}
+
+async function uploadSnapshot(blob, extra) {
+    const res = await fetch(`/api/snapshot?device=${encodeURIComponent(CLIENT_ID)}`, { method: 'POST', body: blob });
+    return { ...(await res.json()), bytes: blob.size, ...extra };
+}
+
+const waitFor = ms => new Promise(r => setTimeout(r, ms));
+
+const LAB_COMMANDS = {
+    // Where the page is and what it's doing
+    ping: async () => ({
+        client: CLIENT_ID, v: APP_VERSION, url: location.href, tab: currentTab(),
+        sending: isSending, scanning: isScanning, wakeLock: !!wakeLock,
+        visible: document.visibilityState,
+        screen: DEVICE_INFO.screen, ua: DEVICE_INFO.ua,
+        frameSize, fps: targetFps,
+        encoder: encoder ? { transferId: encoder.transferId, K: encoder.K, chunk: encoder.chunkSize, framesShown: encoder.lastId + 1 } : null,
+        decoder: { transferId: decoder.transferId, solved: decoder.solvedCount, K: decoder.K, framesRead: decoder.receivedCount, done: decoder.isDone },
+        camera: videoTrack() ? videoTrack().getSettings() : null,
+    }),
+
+    // Reload with fresh files, coming back to the same tab
+    reload: async () => {
+        const url = new URL(location.href);
+        url.searchParams.set('tab', currentTab());
+        setTimeout(() => location.replace(url), 100);
+        return { reloading: url.href };
+    },
+
+    // Reload with changed address parameters, e.g. { "scans": "1" }; null removes one
+    open: async (args) => {
+        const url = new URL(location.href);
+        for (const [k, v] of Object.entries(args)) v === null ? url.searchParams.delete(k) : url.searchParams.set(k, v);
+        url.searchParams.set('lab', '1');
+        if (!url.searchParams.has('tab')) url.searchParams.set('tab', currentTab());
+        setTimeout(() => location.replace(url), 100);
+        return { opening: url.href };
+    },
+
+    tab: async ({ name }) => {
+        switchTab(name === 'recv' || name === 'receiver' ? 'recv' : 'send');
+        return { tab: currentTab() };
+    },
+
+    // Start beaming. args: preset ('random' default), kb (random size), text, size (S/M/L/XL), fps (8/15 or any)
+    beam: async ({ preset = 'random', kb = 50, text, size, fps } = {}) => {
+        if (isSending) stopSending('lab');
+        if (currentTab() !== 'send') switchTab('send');
+        if (size && size !== frameSize) await setFrameSize(size);
+        if (fps) setSpeed(+fps);
+        if (text !== undefined) {
+            document.getElementById('send-input').value = text;
+        } else {
+            await loadPreset(preset, +kb);
+        }
+        await toggleSending();
+        return { transferId: encoder.transferId, K: encoder.K, chunk: encoder.chunkSize, size: frameSize, fps: targetFps, ...payloadMeta };
+    },
+
+    stop: async () => {
+        const was = isSending ? { transferId: encoder.transferId, framesShown: encoder.lastId + 1 } : null;
+        if (isSending) stopSending('lab');
+        const card = cardRun ? stopCard() : null;
+        const rfc = rfcRun ? stopRfc() : null;
+        return { stopped: was, card, rfc };
+    },
+
+    // Sender: show the density test card. { grid: N (≡ 1 mod 4), levels: 2/4/8, fps, seed, greys: [..] }
+    // blank: seconds of data-free frames first, so the receiver can lock on to the corners
+    card: async ({ grid = 101, levels = 2, fps = 4, seed = 1, greys, blank = 1.5 } = {}) => {
+        if (isSending) stopSending('lab');
+        if (cardRun) stopCard();
+        if ((grid - 1) % 4) throw new Error('grid must be 1 more than a multiple of 4 (e.g. 101, 149, 201)');
+        startCard({ N: grid, L: levels, fps, seed, greys: greys || defaultGreys(levels), blank });
+        await waitFor(300);
+        return cardStatus();
+    },
+
+    'card-status': async () => cardStatus(),
+
+    // Sender: beam a payload with RapidFire code v1. { kb, fps, grid, bands, ecc, blank, blankEvery }
+    'rfc-send': async (args = {}) => startRfc(args),
+
+    // Receiver: receive one RapidFire code v1 transfer. { grid, bands, ecc, seconds }
+    'rfc-receive': async (args = {}) => receiveRfc(args),
+
+    // Receiver: watch the card for a while and count misread squares.
+    // { grid, levels, seed, k0 (sender's frame now), fps (sender's), seconds, rate (pictures/s to analyse) }
+    'card-measure': async (args) => measureCard(args),
+
+    // Receiver: clear and start listening (camera on)
+    reset: async () => {
+        if (currentTab() !== 'recv') switchTab('recv');
+        resetReceiver();
+        await waitFor(800);
+        return { scanning: isScanning, camera: videoTrack() ? videoTrack().getSettings() : null };
+    },
+
+    // Camera request: { width, height, frameRate, facing, label }; {} goes back to defaults.
+    // label picks a specific camera by name, e.g. "camera 2". Kept across reloads. Restarts the camera.
+    camera: async (args = {}) => {
+        if (args.label) {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const match = devices.find(d => d.kind === 'videoinput' && d.label === args.label)
+                || devices.find(d => d.kind === 'videoinput' && d.label.includes(args.label));
+            if (!match) throw new Error(`no camera named "${args.label}"`);
+            args = { ...args, deviceId: match.deviceId };
+        }
+        cameraOverrides = Object.keys(args).length ? { ...cameraOverrides, ...args } : {};
+        try { localStorage.setItem('rapidfire.labCamera', JSON.stringify(cameraOverrides)); } catch (e) {}
+        if (currentTab() === 'recv') {
+            await initCamera();
+            await waitFor(500);
+        }
+        return { requested: cameraOverrides, settings: videoTrack() ? videoTrack().getSettings() : null };
+    },
+
+    // What the camera can do: capabilities, current settings, photo capabilities
+    'camera-info': async () => {
+        const track = videoTrack();
+        if (!track) return { error: 'camera is off (open the receive tab first)' };
+        const info = {
+            settings: track.getSettings(),
+            capabilities: track.getCapabilities ? track.getCapabilities() : null,
+            label: track.label,
+        };
+        if ('ImageCapture' in window) {
+            try {
+                const ic = new ImageCapture(track);
+                info.photoCapabilities = await ic.getPhotoCapabilities();
+                info.photoSettings = await ic.getPhotoSettings();
+            } catch (e) {
+                info.photoError = String(e);
+            }
+        }
+        const devices = await navigator.mediaDevices.enumerateDevices();
+        info.cameras = devices.filter(d => d.kind === 'videoinput').map(d => d.label || d.deviceId.slice(0, 8));
+        return jsonSafe(info);
+    },
+
+    // Apply track constraints, e.g. { "advanced": [{ "focusMode": "manual", "focusDistance": 0.2 }] }
+    constraints: async (args) => {
+        const track = videoTrack();
+        if (!track) return { error: 'camera is off' };
+        await track.applyConstraints(args);
+        return jsonSafe({ settings: track.getSettings() });
+    },
+
+    torch: async ({ on = true } = {}) => {
+        const track = videoTrack();
+        if (!track) return { error: 'camera is off' };
+        await track.applyConstraints({ advanced: [{ torch: !!on }] });
+        return { torch: track.getSettings().torch };
+    },
+
+    // One picture of what the camera sees right now, saved on the Mac in .lab/snapshots
+    snapshot: async ({ quality = 0.85, crop = 'full' } = {}) => {
+        const video = document.getElementById('camera-video');
+        if (!video || !video.videoWidth) return { error: 'camera is off' };
+        let { sx, sy, side } = centreSquare(video);
+        let w = side, h = side;
+        if (crop === 'full') { sx = 0; sy = 0; w = video.videoWidth; h = video.videoHeight; }
+        const canvas = document.createElement('canvas');
+        canvas.width = w;
+        canvas.height = h;
+        canvas.getContext('2d').drawImage(video, sx, sy, w, h, 0, 0, w, h);
+        const blob = await new Promise(r => canvas.toBlob(r, 'image/jpeg', quality));
+        return uploadSnapshot(blob, { width: w, height: h, crop });
+    },
+
+    // A full-resolution still photo through ImageCapture (photo-mode test), timed
+    photo: async ({ upload = true } = {}) => {
+        const track = videoTrack();
+        if (!track || !('ImageCapture' in window)) return { error: 'no camera or no ImageCapture' };
+        const ic = new ImageCapture(track);
+        const t0 = performance.now();
+        const blob = await ic.takePhoto();
+        const ms = Math.round(performance.now() - t0);
+        const bitmap = await createImageBitmap(blob);
+        const dims = { width: bitmap.width, height: bitmap.height, ms };
+        bitmap.close();
+        return upload ? uploadSnapshot(blob, dims) : { ...dims, bytes: blob.size };
+    },
+
+    // Where and how big the code is drawn while beaming (sender), kept across reloads.
+    // { size: px, dx: px, dy: px } moves it within a dark full-window backdrop; {} goes back to normal.
+    place: async (args = {}) => {
+        try {
+            if (Object.keys(args).length) localStorage.setItem('rapidfire.labPlace', JSON.stringify(args));
+            else localStorage.removeItem('rapidfire.labPlace');
+        } catch (e) {}
+        applyPlacement();
+        await waitFor(400);
+        const c = document.querySelector('#qr-canvas-container canvas');
+        const r = c ? c.getBoundingClientRect() : null;
+        return { placement: args, canvasPx: c ? c.width : null, onScreen: r ? [Math.round(r.left), Math.round(r.top), Math.round(r.width)] : null, viewport: [innerWidth, innerHeight] };
+    },
+
+    // Run JavaScript in the page; the value of `return` comes back
+    eval: async ({ code }) => {
+        const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
+        return jsonSafe(await new AsyncFunction(code)());
+    },
+};
+
+async function runLabCommand(msg) {
+    const t0 = performance.now();
+    let reply;
+    try {
+        const fn = LAB_COMMANDS[msg.cmd];
+        if (!fn) throw new Error(`unknown command "${msg.cmd}". Known: ${Object.keys(LAB_COMMANDS).join(', ')}`);
+        reply = { id: msg.id, ok: true, result: await fn(msg.args || {}) };
+    } catch (e) {
+        reply = { id: msg.id, ok: false, error: String(e && e.message || e) };
+    }
+    reply.ms = Math.round(performance.now() - t0);
+    fetch('/api/result', { method: 'POST', body: JSON.stringify(reply), headers: { 'Content-Type': 'application/json' } }).catch(() => {});
+    labState();
+}
+
+function applyPlacement() {
+    let place = null;
+    try { place = JSON.parse(localStorage.getItem('rapidfire.labPlace')); } catch (e) {}
+    let style = document.getElementById('lab-place');
+    if (!place) {
+        if (style) style.remove();
+        return;
+    }
+    if (!style) {
+        style = document.createElement('style');
+        style.id = 'lab-place';
+        document.head.appendChild(style);
+    }
+    const size = place.size ? `${place.size}px` : 'calc(min(100vw, 100vh) - 60px)';
+    style.textContent = `
+        #screen-send.is-beaming .send-preview-col { position: fixed !important; inset: 0 !important; z-index: 9000; background: #222;
+            display: flex !important; align-items: center; justify-content: center; max-height: none !important; opacity: 1 !important; transform: none !important; }
+        #screen-send.is-beaming .send-preview-col .qr-wrapper { background: none; border: none; min-height: 0 !important; height: auto !important; padding: 0; }
+        #screen-send.is-beaming .send-preview-col .qr-inner { width: ${size} !important; height: ${size} !important; aspect-ratio: auto !important;
+            transform: translate(${place.dx || 0}px, ${place.dy || 0}px); }`;
+}
+
+async function startLabRemote() {
+    applyPlacement();
+    try { cameraOverrides = JSON.parse(localStorage.getItem('rapidfire.labCamera')) || {}; } catch (e) {}
+    // No offline cache under the lab remote: drop any installed service worker and its files
+    if ('serviceWorker' in navigator) {
+        try {
+            for (const r of await navigator.serviceWorker.getRegistrations()) await r.unregister();
+            for (const k of await caches.keys()) await caches.delete(k);
+        } catch (e) {}
+    }
+
+    const params = new URLSearchParams(location.search);
+    if (params.get('tab') === 'recv') switchTab('recv');
+
+    holdWakeLock();
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible' && !wakeLock) holdWakeLock();
+        labState();
+    });
+
+    // Keep the command line open: the server sends a heartbeat every 15 s; if the browser gives
+    // up on the connection (Firefox does after some errors) or the heartbeat stops, reconnect.
+    let source = null;
+    let lastBeat = Date.now();
+    const connect = () => {
+        if (source) source.close();
+        const role = currentTab() === 'recv' ? 'receiver' : 'sender';
+        source = new EventSource(`/api/events?client=${encodeURIComponent(CLIENT_ID)}&device=${DEVICE_ID}&role=${role}&v=${APP_VERSION}`);
+        lastBeat = Date.now();
+        source.onopen = () => { lastBeat = Date.now(); labState(); };
+        source.addEventListener('ping', () => { lastBeat = Date.now(); });
+        source.onmessage = (e) => {
+            lastBeat = Date.now();
+            try { runLabCommand(JSON.parse(e.data)); } catch (err) { console.warn('Bad lab command', err); }
+        };
+        source.onerror = () => {
+            if (source.readyState === EventSource.CLOSED) setTimeout(connect, 2000);
+        };
+    };
+    connect();
+    setInterval(() => {
+        if (Date.now() - lastBeat > 40000) {
+            report('lab-reconnect', { client: CLIENT_ID, silentFor: Math.round((Date.now() - lastBeat) / 1000) });
+            connect();
+        }
+    }, 5000);
+
+    // A small badge so it's obvious the page is remote-controlled
+    const badge = document.createElement('div');
+    badge.textContent = `LAB ${CLIENT_ID}`;
+    badge.style.cssText = 'position:fixed;top:6px;right:8px;z-index:9999;font:600 11px system-ui;background:#FBAB57;color:#222;padding:2px 8px;border-radius:999px;opacity:.85;pointer-events:none';
+    document.body.appendChild(badge);
+}

@@ -1,9 +1,15 @@
-const CACHE_NAME = 'rapidfireqr-v1.3';
+const CACHE_NAME = 'rapidfireqr-v2.16';
 const ASSETS = [
   '/',
   '/index.html',
   '/app.js',
   '/fountain.js',
+  '/qr.js',
+  '/base45.js',
+  '/envelope.js',
+  '/card.js',
+  '/rfc.js',
+  '/gpusample.js',
   '/qrcode.min.js',
   '/jsqr.js',
   '/manifest.json',

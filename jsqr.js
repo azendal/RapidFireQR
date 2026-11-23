@@ -377,6 +377,8 @@ function jsQR(data, width, height, providedOptions) {
     return result;
 }
 jsQR.default = jsQR;
+// RapidFireQR: expose the finder and grid mapping so custom codes can reuse them
+jsQR.internals = { binarize: binarizer_1.binarize, locate: locator_1.locate, extract: extractor_1.extract, rsDecode: __webpack_require__(9).decode };
 exports.default = jsQR;
 
 

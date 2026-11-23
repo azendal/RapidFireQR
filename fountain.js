@@ -1,88 +1,118 @@
-// fountain.js - Lightweight Luby Transform (LT) Fountain Code Implementation
+// fountain.js - systematic fountain code over GF(2)
+//
+// The sender splits the data into K blocks and emits an endless stream of droplets:
+//   droplet 0 .. K-1  carry block 0 .. K-1 as they are (systematic part),
+//   droplet K ..      each carry the XOR of a random half of the blocks (repair part).
+// The receiver solves the droplets it has caught with incremental Gaussian elimination,
+// so it needs about K + 2 useful droplets no matter which ones it missed.
+//
+// Packet layout (big-endian):
+//   [0..1]  transfer id (uint16)
+//   [2..4]  total data length in bytes (uint24, up to 16 MB)
+//   [5..7]  droplet id (uint24)
+//   [8.. ]  payload, chunkSize bytes (chunkSize = packet length - 8)
 
-// Simple deterministic PRNG (SplitMix32 / Mulberry32)
+export const HEADER_BYTES = 8;
+const MAX_LENGTH = 0xFFFFFF;
+const ID_MASK = 0xFFFFFF;
+
+// Deterministic 32-bit PRNG (mulberry32)
 function mulberry32(a) {
-    return function() {
+    return function () {
         let t = a += 0x6D2B79F5;
         t = Math.imul(t ^ t >>> 15, t | 1);
         t ^= t + Math.imul(t ^ t >>> 7, t | 61);
-        return ((t ^ t >>> 14) >>> 0) / 4294967296;
-    }
+        return (t ^ t >>> 14) >>> 0;
+    };
 }
 
-// Generate degree from Ideal Soliton / Robust Soliton-like distribution
-function sampleDegree(prng, K) {
-    if (K <= 1) return 1;
-    const p = prng();
-    // Simplified distribution biased towards degree 1 and small degrees
-    // Ensures quick ripple startup and good coverage
-    if (p < 1 / K) return 1;
-    for (let d = 2; d <= K; d++) {
-        if (p < 1 / d) return d;
+// Which blocks a droplet combines, as a bitset of K bits (Uint32Array of ceil(K/32) words).
+export function dropletCoefficients(dropletId, K) {
+    const words = Math.ceil(K / 32);
+    const bits = new Uint32Array(words);
+    if (dropletId < K) {
+        bits[dropletId >>> 5] = 1 << (dropletId & 31);
+        return bits;
     }
-    return Math.min(K, Math.max(2, Math.floor(prng() * K) + 1));
+    const rand = mulberry32(dropletId * 0x9E3779B1);
+    for (let w = 0; w < words; w++) bits[w] = rand();
+    const tail = K & 31;
+    if (tail) bits[words - 1] &= (1 << tail) - 1;
+    let empty = true;
+    for (let w = 0; w < words; w++) if (bits[w]) { empty = false; break; }
+    if (empty) {
+        const i = dropletId % K;
+        bits[i >>> 5] = 1 << (i & 31);
+    }
+    return bits;
 }
 
-// Pick degree unique indices out of [0, K - 1] using PRNG
-function getBlockIndices(seed, K) {
-    const prng = mulberry32(seed);
-    const degree = sampleDegree(prng, K);
-    const chosen = new Set();
-    while (chosen.size < degree) {
-        const idx = Math.floor(prng() * K);
-        chosen.add(idx);
-    }
-    return Array.from(chosen);
+function paddedLength(n) {
+    return (n + 3) & ~3;
 }
 
 export class FountainEncoder {
-    constructor(dataBytes, chunkSize = 160, transferId = null) {
-        this.chunkSize = chunkSize;
+    // maxChunkSize: the most payload bytes one droplet may carry.
+    // Blocks are sized evenly so a short payload makes small frames.
+    constructor(dataBytes, maxChunkSize, transferId = null) {
+        if (dataBytes.length > MAX_LENGTH) throw new Error('Payload too large (16 MB max)');
         this.totalLength = dataBytes.length;
-        this.K = Math.max(1, Math.ceil(this.totalLength / chunkSize));
-        this.transferId = transferId !== null ? transferId : Math.floor(Math.random() * 65535);
-        
-        // Pad data into exactly K chunks of chunkSize
+        this.K = Math.max(1, Math.ceil(this.totalLength / maxChunkSize));
+        this.chunkSize = Math.max(1, Math.ceil(this.totalLength / this.K));
+        this.transferId = transferId !== null ? transferId : Math.floor(Math.random() * 65536);
+
+        const padded = paddedLength(this.chunkSize);
         this.chunks = [];
         for (let i = 0; i < this.K; i++) {
-            const chunk = new Uint8Array(chunkSize);
-            const start = i * chunkSize;
-            const slice = dataBytes.subarray(start, Math.min(start + chunkSize, this.totalLength));
-            chunk.set(slice);
-            this.chunks.push(chunk);
+            const chunk = new Uint8Array(padded);
+            const start = i * this.chunkSize;
+            chunk.set(dataBytes.subarray(start, Math.min(start + this.chunkSize, this.totalLength)));
+            this.chunks.push(new Uint32Array(chunk.buffer));
         }
-        this.seed = 0;
+        this.nextId = 0;
+        this.lastId = -1;
     }
 
-    // Produces the next droplet: Uint8Array [2 bytes transferId, 2 bytes K, 4 bytes seed, 4 bytes totalLen, N bytes payload]
+    get packetSize() {
+        return HEADER_BYTES + this.chunkSize;
+    }
+
     nextDroplet() {
-        this.seed = (this.seed + 1) & 0xFFFFFF; // 24-bit counter/seed
-        const indices = getBlockIndices(this.seed, this.K);
-        
-        // XOR blocks together
-        const dropletData = new Uint8Array(this.chunkSize);
-        for (const idx of indices) {
-            const block = this.chunks[idx];
-            for (let i = 0; i < this.chunkSize; i++) {
-                dropletData[i] ^= block[i];
+        const id = this.nextId;
+        this.nextId = (this.nextId + 1) & ID_MASK;
+        this.lastId = id;
+
+        const bits = dropletCoefficients(id, this.K);
+        const acc = new Uint32Array(this.chunks[0].length);
+        for (let i = 0; i < this.K; i++) {
+            if (bits[i >>> 5] & (1 << (i & 31))) {
+                const block = this.chunks[i];
+                for (let j = 0; j < acc.length; j++) acc[j] ^= block[j];
             }
         }
 
-        // Header (12 bytes):
-        // [0..1]: Transfer ID (Uint16)
-        // [2..3]: K (Uint16)
-        // [4..7]: Seed (Uint32)
-        // [8..11]: Total file length (Uint32)
-        const packet = new Uint8Array(12 + this.chunkSize);
-        const view = new DataView(packet.buffer);
-        view.setUint16(0, this.transferId, false);
-        view.setUint16(2, this.K, false);
-        view.setUint32(4, this.seed, false);
-        view.setUint32(8, this.totalLength, false);
-        packet.set(dropletData, 12);
-
+        const packet = new Uint8Array(HEADER_BYTES + this.chunkSize);
+        packet[0] = this.transferId >>> 8;
+        packet[1] = this.transferId & 0xFF;
+        packet[2] = this.totalLength >>> 16;
+        packet[3] = (this.totalLength >>> 8) & 0xFF;
+        packet[4] = this.totalLength & 0xFF;
+        packet[5] = id >>> 16;
+        packet[6] = (id >>> 8) & 0xFF;
+        packet[7] = id & 0xFF;
+        packet.set(new Uint8Array(acc.buffer, 0, this.chunkSize), HEADER_BYTES);
         return packet;
     }
+}
+
+export function readHeader(packet) {
+    if (packet.length < HEADER_BYTES + 1) return null;
+    return {
+        transferId: (packet[0] << 8) | packet[1],
+        totalLength: (packet[2] << 16) | (packet[3] << 8) | packet[4],
+        dropletId: (packet[5] << 16) | (packet[6] << 8) | packet[7],
+        chunkSize: packet.length - HEADER_BYTES,
+    };
 }
 
 export class FountainDecoder {
@@ -95,102 +125,75 @@ export class FountainDecoder {
         this.K = null;
         this.totalLength = null;
         this.chunkSize = null;
-        this.sourceBlocks = [];     // Array of Uint8Array | null
-        this.solvedCount = 0;
-        this.equations = [];        // Array of { indices: Set<number>, data: Uint8Array }
+        this.pivots = [];          // pivots[col] = { bits: Uint32Array, data: Uint32Array } | null
+        this.solvedCount = 0;      // rank of the system: how many blocks are pinned down
+        this.receivedCount = 0;    // distinct droplets read
         this.isDone = false;
-        this.seenSeeds = new Set();
+        this.seenIds = new Set();
+        this.blocks = null;
     }
 
-    // Processes a received packet
-    addDroplet(packetBytes) {
-        if (packetBytes.length < 13) return false;
+    // Returns true when the droplet added new information.
+    addDroplet(packet) {
+        const h = readHeader(packet);
+        if (!h) return false;
 
-        const view = new DataView(packetBytes.buffer, packetBytes.byteOffset, packetBytes.byteLength);
-        const transferId = view.getUint16(0, false);
-        const K = view.getUint16(2, false);
-        const seed = view.getUint32(4, false);
-        const totalLength = view.getUint32(8, false);
-        const payload = packetBytes.subarray(12);
-
-        // Detect if a new transfer has started
-        if (this.transferId !== null && this.transferId !== transferId) {
-            this.reset();
-        }
+        const sameTransfer = this.transferId === h.transferId
+            && this.totalLength === h.totalLength
+            && this.chunkSize === h.chunkSize;
+        if (this.transferId !== null && !sameTransfer) this.reset();
 
         if (this.isDone) return false;
-
-        if (this.seenSeeds.has(seed)) return false;
-        this.seenSeeds.add(seed);
+        if (this.seenIds.has(h.dropletId)) return false;
+        this.seenIds.add(h.dropletId);
+        this.receivedCount++;
 
         if (this.K === null) {
-            this.transferId = transferId;
-            this.K = K;
-            this.totalLength = totalLength;
-            this.chunkSize = payload.length;
-            this.sourceBlocks = new Array(K).fill(null);
+            this.transferId = h.transferId;
+            this.totalLength = h.totalLength;
+            this.chunkSize = h.chunkSize;
+            this.K = Math.max(1, Math.ceil(h.totalLength / h.chunkSize));
+            this.pivots = new Array(this.K).fill(null);
         }
 
-        const indices = new Set(getBlockIndices(seed, this.K));
-        const data = new Uint8Array(payload);
+        const bits = dropletCoefficients(h.dropletId, this.K);
+        const bytes = new Uint8Array(paddedLength(this.chunkSize));
+        bytes.set(packet.subarray(HEADER_BYTES));
+        const data = new Uint32Array(bytes.buffer);
 
-        // Reduce equation with already known blocks
-        for (const idx of Array.from(indices)) {
-            if (this.sourceBlocks[idx] !== null) {
-                const known = this.sourceBlocks[idx];
-                for (let i = 0; i < this.chunkSize; i++) {
-                    data[i] ^= known[i];
+        // Eliminate known pivots from lowest column up. The first set column with no
+        // pivot becomes this row's pivot; every column below it is then already zero.
+        const words = bits.length;
+        for (let w = 0; w < words; w++) {
+            while (bits[w]) {
+                const col = (w << 5) + (31 - Math.clz32(bits[w] & -bits[w]));
+                const pivot = this.pivots[col];
+                if (!pivot) {
+                    this.pivots[col] = { bits, data };
+                    this.solvedCount++;
+                    if (this.solvedCount === this.K) this.finish();
+                    return true;
                 }
-                indices.delete(idx);
+                for (let k = w; k < words; k++) bits[k] ^= pivot.bits[k];
+                for (let k = 0; k < data.length; k++) data[k] ^= pivot.data[k];
             }
         }
-
-        if (indices.size === 0) return false;
-
-        this.equations.push({ indices, data });
-        this.processRipple();
-        return true;
+        return false; // nothing new: a combination of droplets already held
     }
 
-    // Belief propagation solver (ripple decoding)
-    processRipple() {
-        let changed = true;
-        while (changed) {
-            changed = false;
-            for (let i = 0; i < this.equations.length; i++) {
-                const eq = this.equations[i];
-                if (!eq) continue;
-
-                // Eliminate knowns from this equation
-                for (const idx of Array.from(eq.indices)) {
-                    if (this.sourceBlocks[idx] !== null) {
-                        const known = this.sourceBlocks[idx];
-                        for (let j = 0; j < this.chunkSize; j++) {
-                            eq.data[j] ^= known[j];
-                        }
-                        eq.indices.delete(idx);
-                    }
-                }
-
-                // If only 1 unknown remains, we solved a source block!
-                if (eq.indices.size === 1) {
-                    const [solvedIdx] = eq.indices;
-                    this.sourceBlocks[solvedIdx] = eq.data;
-                    this.solvedCount++;
-                    this.equations[i] = null;
-                    changed = true;
-                } else if (eq.indices.size === 0) {
-                    this.equations[i] = null; // Redundant equation
+    // Back-substitution: clear every column above each pivot, highest pivot first.
+    finish() {
+        for (let col = this.K - 1; col >= 0; col--) {
+            const row = this.pivots[col];
+            for (let j = col + 1; j < this.K; j++) {
+                if (row.bits[j >>> 5] & (1 << (j & 31))) {
+                    const other = this.pivots[j].data;
+                    for (let k = 0; k < row.data.length; k++) row.data[k] ^= other[k];
                 }
             }
         }
-
-        // Clean out nulls
-        this.equations = this.equations.filter(Boolean);
-
-        if (this.K !== null && this.solvedCount === this.K) {
-            this.isDone = true;
-        }
+        this.blocks = this.pivots.map(p => new Uint8Array(p.data.buffer, 0, this.chunkSize));
+        this.isDone = true;
     }
 
     getProgress() {
@@ -201,12 +204,10 @@ export class FountainDecoder {
     getRecoveredData() {
         if (!this.isDone) return null;
         const full = new Uint8Array(this.totalLength);
-        let offset = 0;
         for (let i = 0; i < this.K; i++) {
-            const block = this.sourceBlocks[i];
-            const toCopy = Math.min(this.chunkSize, this.totalLength - offset);
-            full.set(block.subarray(0, toCopy), offset);
-            offset += toCopy;
+            const start = i * this.chunkSize;
+            const n = Math.min(this.chunkSize, this.totalLength - start);
+            if (n > 0) full.set(this.blocks[i].subarray(0, n), start);
         }
         return full;
     }

@@ -219,6 +219,10 @@
             background: var(--accent);
             color: #222222;
         }
+        .speed-toggle.compact .speed-btn {
+            min-width: 0;
+            padding: 0.5rem 0.8rem;
+        }
 
         /* Switch toggle */
         .switch {
@@ -472,6 +476,80 @@
             font-size: 0.9rem;
             font-weight: 600;
         }
+
+        /* Transfer measurement */
+        .transfer-stats {
+            display: flex;
+            flex-direction: column;
+            gap: 0.35rem;
+            font-size: 0.78rem;
+        }
+        .stat-row {
+            display: flex;
+            gap: 0.75rem;
+            align-items: baseline;
+        }
+        .stat-label {
+            color: var(--text-secondary);
+            flex: 0 0 4.5rem;
+        }
+        .stat-value {
+            color: var(--text-primary);
+            min-width: 0;
+            overflow-wrap: anywhere;
+        }
+        .stat-ok {
+            color: #7ccf8a;
+            font-weight: 600;
+        }
+        .stat-bad {
+            color: #e05d5d;
+            font-weight: 600;
+        }
+
+        /* Test log */
+        .test-log-card {
+            display: none;
+            gap: 0.6rem;
+        }
+        .test-log-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .test-log-actions {
+            display: flex;
+            gap: 0.4rem;
+        }
+        .test-log-body {
+            overflow-x: auto;
+            max-height: 240px;
+            overflow-y: auto;
+        }
+        .test-log-body table {
+            border-collapse: collapse;
+            font-size: 0.72rem;
+            white-space: nowrap;
+            font-variant-numeric: tabular-nums;
+        }
+        .test-log-body th {
+            color: var(--text-secondary);
+            font-weight: 600;
+            text-align: left;
+            padding: 0.2rem 0.6rem 0.3rem 0;
+            position: sticky;
+            top: 0;
+            background: var(--surface);
+        }
+        .test-log-body td {
+            color: var(--text-primary);
+            padding: 0.2rem 0.6rem 0.2rem 0;
+            border-top: 1px solid var(--border);
+        }
+        .test-log-body tr.log-bad td {
+            color: #e05d5d;
+        }
         .ack-container {
             display: flex;
             align-items: center;
@@ -587,6 +665,12 @@
                 width: 280px;
                 height: 280px;
             }
+            /* While beaming, the code fills its column so bigger sizes keep readable squares */
+            #screen-send.is-beaming .send-preview-col .qr-inner {
+                width: 100%;
+                height: auto;
+                aspect-ratio: 1 / 1;
+            }
             .beaming-summary-card {
                 display: none !important;
             }
@@ -692,8 +776,18 @@
                 pointer-events: auto;
             }
 
+            #screen-send.is-beaming .qr-wrapper {
+                padding: 0.5rem;
+            }
+            /* While beaming, the code fills the screen width so bigger sizes keep readable squares */
+            #screen-send.is-beaming .qr-inner {
+                width: 100%;
+                height: auto;
+                aspect-ratio: 1 / 1;
+            }
+
             #screen-send.is-beaming .send-preview-col {
-                max-height: 480px;
+                max-height: 720px;
                 opacity: 1;
                 transform: translateY(0) scale(1);
                 overflow: visible;
@@ -766,6 +860,7 @@
                                 <button class="chip" onclick="loadPreset('medium')">Medium</button>
                                 <button class="chip" onclick="loadPreset('large')">Large</button>
                                 <button class="chip" onclick="loadPreset('heavy')">Heavy</button>
+                                <button class="chip" onclick="loadPreset('random')">Random 50K</button>
                             </div>
                         </div>
 
@@ -782,6 +877,15 @@
                             <div class="speed-toggle">
                                 <button class="speed-btn active" id="speed-safe" onclick="setSpeed(8)">Safe</button>
                                 <button class="speed-btn" id="speed-turbo" onclick="setSpeed(15)">Turbo</button>
+                            </div>
+                        </div>
+                        <div class="slider-row" style="border-top: 1px solid var(--border); padding-top: 0.75rem;">
+                            <span>Code Size</span>
+                            <div class="speed-toggle compact">
+                                <button class="speed-btn active" data-frame-size="S" onclick="setFrameSize('S')">S</button>
+                                <button class="speed-btn" data-frame-size="M" onclick="setFrameSize('M')">M</button>
+                                <button class="speed-btn" data-frame-size="L" onclick="setFrameSize('L')">L</button>
+                                <button class="speed-btn" data-frame-size="XL" onclick="setFrameSize('XL')">XL</button>
                             </div>
                         </div>
                         <div class="slider-row" style="border-top: 1px solid var(--border); padding-top: 0.75rem;">
@@ -895,8 +999,21 @@
 
                 <!-- Result Card (appears directly under the progress pill) -->
                 <div class="result-card" id="result-box">
+                    <div class="transfer-stats" id="transfer-stats"></div>
                     <button class="btn" id="btn-copy-result" onclick="copyResult()">Copy to Clipboard</button>
                     <textarea id="result-text" readonly></textarea>
+                </div>
+
+                <!-- Test log: one row per finished transfer, kept on this device -->
+                <div class="card test-log-card" id="test-log-card">
+                    <div class="test-log-header">
+                        <span class="result-title">Test log</span>
+                        <div class="test-log-actions">
+                            <button class="chip" id="btn-copy-log" onclick="copyTestLog()">Copy</button>
+                            <button class="chip" onclick="clearTestLog()">Clear</button>
+                        </div>
+                    </div>
+                    <div class="test-log-body" id="test-log-body"></div>
                 </div>
             </div>
 
