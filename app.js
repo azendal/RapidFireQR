@@ -3,8 +3,9 @@ import { encodeQR, alphanumericCapacity } from './qr.js';
 import { base45Encode, base45Decode, bytesForChars } from './base45.js';
 import { packPayload, unpackPayload } from './envelope.js';
 import { cardLayout, paintCard, CardAnalyzer, defaultGreys } from './card.js';
-import { rfcPlan, buildFrame, readFrame, paintFrame, threshold } from './rfc.js';
+import { rfcPlan, buildFrame, readFrame, paintFrame, threshold, colourSeparation } from './rfc.js';
 import { GpuSampler } from './gpusample.js';
+import { rsDecode as fastRsDecode } from './rs.js';
 
 // --- Frame format ---
 // Each frame is an alphanumeric-mode QR holding PACKET_PREFIX + base45(packet).
@@ -85,7 +86,7 @@ const DEVICE_INFO = {
 };
 
 // Bump with CACHE_NAME in sw.js, so reports show which build each device is running
-const APP_VERSION = '2.16';
+const APP_VERSION = '2.29';
 
 function report(event, data = {}) {
     if (!LAB_MODE) return;
@@ -1401,7 +1402,10 @@ function blitGrid(off, N) {
     return scale;
 }
 
-async function startRfc({ kb = 50, fps = 10, grid = 249, bands = 8, ecc = 16, levels = 2, greys = null, blank = 1.5, blankEvery = 45, text } = {}) {
+// stagger: 'down' or 'up' changes the bands one after another instead of all at once (each band
+// still changes `fps` times a second), so a picture taken while the screen changes loses only the
+// bands changing then. Any band can be decoded on its own, so the receiver needs no change.
+async function startRfc({ kb = 50, fps = 10, grid = 249, bands = 8, ecc = 16, levels = 2, greys = null, blank = 1.5, blankEvery = 45, text, stagger = null, shiftEvery = 0, ahead = 4 } = {}) {
     if (isSending) stopSending('lab');
     if (cardRun) stopCard();
     if (rfcRun) stopRfc();
@@ -1427,7 +1431,7 @@ async function startRfc({ kb = 50, fps = 10, grid = 249, bands = 8, ecc = 16, le
     off.height = grid;
     const offCtx = off.getContext('2d');
     const img = offCtx.createImageData(grid, grid);
-    rfcRun = { rfc, enc, fps, off, offCtx, img, frame: 0, blankUntil: performance.now() + blank * 1000, blankEvery, rafId: null, startedAt: performance.now() };
+    rfcRun = { rfc, enc, fps, off, offCtx, img, frame: 0, blankUntil: performance.now() + blank * 1000, blankEvery, rafId: null, startedAt: performance.now(), timing: [] };
     const draw = () => {
         const r = rfcRun;
         const isBlank = performance.now() < r.blankUntil || (r.blankEvery && r.frame % r.blankEvery === 0);
@@ -1437,17 +1441,110 @@ async function startRfc({ kb = 50, fps = 10, grid = 249, bands = 8, ecc = 16, le
         r.frame++;
         document.getElementById('beam-stats').innerText = `RapidFire v1 ${grid}×${grid} · frame ${r.frame} · ${r.enc.K} blocks · ${fps} fps`;
     };
+    if (stagger) {
+        // Every screen refresh: give each band whose turn has come a new packet, then redraw
+        const period = 1000 / fps, t0 = performance.now();
+        const packets = new Array(bands).fill(null);
+        const due = Array.from({ length: bands }, (_, b) => {
+            const k = stagger === 'up' ? bands - 1 - b : b;
+            return t0 + blank * 1000 + (k * period) / bands;
+        });
+        let wasBlank = true;
+        const stick = (now) => {
+            const r = rfcRun;
+            if (!r) return;
+            const since = now - t0 - blank * 1000;
+            // blank for the lead-in, then for one period every blankEvery periods (lock-on aid)
+            const isBlank = since < 0 || (r.blankEvery && since % (r.blankEvery * period) < period);
+            let changed = isBlank !== wasBlank;
+            if (!isBlank) {
+                for (let b = 0; b < bands; b++) {
+                    if (now >= due[b] || !packets[b]) {
+                        packets[b] = r.enc.nextDroplet();
+                        while (due[b] <= now) due[b] += period;
+                        changed = true;
+                    }
+                }
+            } else {
+                packets.fill(null);
+            }
+            wasBlank = isBlank;
+            if (changed) {
+                paintFrame(r.img, r.rfc, isBlank ? null : buildFrame(r.rfc, packets), greys);
+                r.offCtx.putImageData(r.img, 0, 0);
+                r.scale = blitGrid(r.off, r.rfc.N);
+                r.frame++;
+            }
+            r.rafId = requestAnimationFrame(stick);
+        };
+        rfcRun.rafId = requestAnimationFrame(stick);
+        const info = { transferId: enc.transferId, K: enc.K, chunk: enc.chunkSize, packetBytes: rfc.packetBytes, perFrame: rfc.packetBytes * bands, bytes: bytes.length, sentBytes: packed.length, compressed, grid, bands, ecc, levels, fps, stagger };
+        report('rfc-start', info);
+        return info;
+    }
     let last = -Infinity;
-    const tick = (now) => {
-        if (!rfcRun) return;
-        const interval = 1000 / rfcRun.fps;
-        if (now - last >= interval - 4) {
-            last = now - last < interval * 2 ? last + interval : now;
-            draw();
+    // Frames are built a few ahead on a background thread: building one takes longer than a screen
+    // refresh for dense codes, and a frame shown late lands across two camera pictures.
+    const run = rfcRun;
+    let blankImg = null;
+    if (ahead) {
+        try {
+            const worker = new Worker(new URL('./rfc-send-worker.js', import.meta.url), { type: 'module' });
+            run.worker = worker;
+            run.ready = [];
+            run.inFlight = 0;
+            run.spare = [];
+            run.request = () => {
+                while (run.ready.length + run.inFlight < ahead) {
+                    run.inFlight++;
+                    const buffer = run.spare.pop();
+                    worker.postMessage({ type: 'build', buffer }, buffer ? [buffer] : []);
+                }
+            };
+            worker.onmessage = (e) => {
+                run.inFlight--;
+                run.buildMs = run.buildMs ? run.buildMs * 0.9 + e.data.ms * 0.1 : e.data.ms;
+                run.ready.push(new ImageData(new Uint8ClampedArray(e.data.buffer), grid, grid));
+            };
+            worker.onerror = (e) => { run.workerError = String(e.message || e); run.worker = null; };
+            worker.postMessage({ type: 'init', grid, bands, ecc, levels, greys, data: packed, chunk: rfc.packetBytes - HEADER_BYTES, transferId: enc.transferId });
+            blankImg = offCtx.createImageData(grid, grid);
+            paintFrame(blankImg, rfc, null, greys);
+            run.request();
+        } catch (e) {
+            run.workerError = String(e.message || e);
+            run.worker = null;
         }
-        rfcRun.rafId = requestAnimationFrame(tick);
+    }
+    const showReady = () => {
+        const isBlank = performance.now() < run.blankUntil || (run.blankEvery && run.frame % run.blankEvery === 0);
+        const pic = isBlank ? blankImg : run.ready.shift();
+        if (!pic) { run.late = (run.late || 0) + 1; return false; } // not built yet: try on the next refresh
+        offCtx.putImageData(pic, 0, 0);
+        run.scale = blitGrid(off, grid);
+        run.frame++;
+        if (!isBlank) { run.spare.push(pic.data.buffer); run.request(); }
+        return true;
     };
-    rfcRun.rafId = requestAnimationFrame(tick);
+    const tick = (now) => {
+        if (!rfcRun || rfcRun !== run) return;
+        const interval = 1000 / run.fps;
+        if (now - last >= interval - 4) {
+            const d0 = performance.now();
+            let shown = true;
+            if (run.worker) shown = showReady(); else draw();
+            if (shown) {
+                last = now - last < interval * 2 ? last + interval : now;
+                if (run.timing.length < 3000) run.timing.push([Math.round(now), +(performance.now() - d0).toFixed(1), Math.round(d0 - now)]);
+                // Every so often hold a frame one screen refresh longer, so the sender's timing
+                // can't stay lined up badly with the camera's for long
+                if (shiftEvery && run.frame % shiftEvery === 0) last += 1000 / 60;
+                if (run.frame % 15 === 0) document.getElementById('beam-stats').innerText = `RapidFire v1 ${grid}×${grid} · frame ${run.frame} · ${enc.K} blocks · ${fps} fps`;
+            }
+        }
+        run.rafId = requestAnimationFrame(tick);
+    };
+    run.rafId = requestAnimationFrame(tick);
     const info = { transferId: enc.transferId, K: enc.K, chunk: enc.chunkSize, packetBytes: rfc.packetBytes, perFrame: rfc.packetBytes * bands, bytes: bytes.length, sentBytes: packed.length, compressed, grid, bands, ecc, levels, fps };
     report('rfc-start', info);
     return info;
@@ -1457,6 +1554,7 @@ function stopRfc() {
     const r = rfcRun;
     if (!r) return null;
     cancelAnimationFrame(r.rafId);
+    if (r.worker) r.worker.terminate();
     rfcRun = null;
     frameCanvas = null;
     frameCtx = null;
@@ -1466,21 +1564,167 @@ function stopRfc() {
     return { frames: r.frame, seconds: +((performance.now() - r.startedAt) / 1000).toFixed(2) };
 }
 
-async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds = 30, gpu = false, frames = true } = {}) {
+// Options for comparing in the lab: fastRs (our Reed-Solomon vs jsQR's), erasures (retry failed
+// codewords naming their least certain bytes), prefetch (copy the next camera frame while decoding),
+// workers (decode in that many background threads; on the test phone they ran no faster).
+async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds = 30, gpu = false, frames = true,
+    fastRs = true, erasures = [0.5, 0.875], prefetch = true, workers = 0, track = 5, steer = false } = {}) {
     if (currentTab() !== 'recv') switchTab('recv');
     if (!isScanning) { await initCamera(); await waitFor(800); }
     const video = document.getElementById('camera-video');
     if (!video.videoWidth) throw new Error('camera is off');
     cardBusy = true;
     const rfc = rfcPlan(grid, bands, ecc, levels);
+    const colour = levels === 8; // 3 bits a square as red/green/blue on or off
+    if (colour) gpu = false;
     const an = new CardAnalyzer({ N: grid, L: 2, seed: 0 });
     const dec = new FountainDecoder();
-    const rsDecode = window.jsQR.internals.rsDecode;
+    const rsDecode = fastRs ? fastRsDecode : window.jsQR.internals.rsDecode;
+    const readOpts = { erasures: fastRs ? erasures : [] };
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     const s = { pictures: 0, lockOns: 0, unlocked: 0, relocks: 0, bandsOk: 0, bandsBad: 0, grabMs: 0, decodeMs: 0, idleMs: 0, skipped: 0, badByBand: [], firstGood: null, done: null };
     let crop = null, badStreak = 0, sampler = null, gpuCheck = null, yBuf = null, useFrames = frames && typeof VideoFrame !== 'undefined';
-    let reader = null, readerTrack = null;
+    let reader = null, readerTrack = null, nextGrab = null, bufTurn = 0;
+    const yBufs = [{}, {}, {}];
+    s.grabWaitMs = 0;
+    s.thresholdMs = 0;
+    s.readMs = 0;
+    s.dropped = 0;
+    s.goodHist = [];
+    s.seq = '';
+    s.sep = [];
+    s.lockLog = [];
+    s.addSeq = []; // ms the fountain decoder took per picture
+    s.workSeq = []; // threshold, read ms per picture
+    s.grabSeq = [];
+    s.refines = 0;
+    s.refineMs = 0;
+    s.moves = [];
+    s.marginSeq = [];
+    s.decoded = 0;
+    s.rescued = 0;
+    // What one decoded picture gives: its packets go to the fountain decoder. A bad lock shows up
+    // as picture after picture with no good band: drop it and lock on again (the sender shows a
+    // blank frame every so often for exactly this).
+    const takePackets = (packets) => {
+        let good = 0;
+        packets.forEach((p, b) => { if (!p) s.badByBand[b] = (s.badByBand[b] || 0) + 1; });
+        for (const p of packets) {
+            if (!p) { s.bandsBad++; continue; }
+            s.bandsOk++;
+            good++;
+            if (s.firstGood === null) s.firstGood = performance.now();
+            dec.addDroplet(p);
+        }
+        s.goodHist[good] = (s.goodHist[good] || 0) + 1; // pictures by number of good bands
+        s.seq += good < 36 ? good.toString(36) : '+'; // one character per picture: its good bands, base 36
+        badStreak = good ? 0 : badStreak + 1;
+        if (badStreak >= 40) {
+            an.positions = null;
+            an.map = null;
+            nextGrab = null; // its copy is of the old region; grab() marks it stale
+            badStreak = 0;
+            s.relocks++;
+        }
+    };
+    // Decoding threads: each takes one picture at a time; a picture that arrives while all are
+    // busy is dropped (a newer one is coming anyway). workers = 0 decodes on this thread.
+    const pool = [];
+    if (workers > 0 && fastRs) {
+        try {
+            for (let w = 0; w < workers; w++) {
+                const worker = new Worker(new URL('./rfc-worker.js', import.meta.url), { type: 'module' });
+                const slot = { worker, busy: false };
+                worker.onmessage = (e) => {
+                    slot.busy = false;
+                    const m = e.data;
+                    s.thresholdMs += m.thresholdMs;
+                    s.readMs += m.readMs;
+                    s.rescued += m.rescued;
+                    s.decoded++;
+                    if (!dec.isDone) takePackets(m.packets);
+                };
+                worker.onerror = (e) => { slot.busy = false; slot.failed = String(e.message || e); };
+                worker.postMessage({ type: 'init', grid, bands, ecc, levels, erasures: readOpts.erasures });
+                pool.push(slot);
+            }
+        } catch (e) {
+            gpuCheck = `workers: ${e.message || e}`;
+        }
+    }
+    // Timing: when the camera's pictures fall on the moments the sender's screen changes, every
+    // picture mixes two frames, and with both at 30 a second it stays that way for seconds. Slowing
+    // the camera by a tenth for a few pictures slides its timing (a few ms a picture)
+    // until the pictures are clean again.
+    const timing = { recent: [], rest: 0, tries: 0, busy: false, log: [] };
+    const steerCamera = async () => {
+        const tr = video.srcObject.getVideoTracks()[0];
+        const { width, height, frameRate } = tr.getSettings();
+        timing.busy = true;
+        timing.log.push([Math.round(performance.now() - t0), s.pictures]);
+        try {
+            const size = { width: { exact: width }, height: { exact: height } };
+            // measured on an iPad: 80 ms at 27 fps moves the timing about 10 ms. Smaller steps only
+            // reached deeper into the bad zone (it can only slide one way).
+            await tr.applyConstraints({ ...size, frameRate: frameRate * 0.9 });
+            await waitFor(80);
+            await tr.applyConstraints({ ...size, frameRate });
+        } catch (e) {
+            timing.error = String(e.message || e);
+            steer = false;
+        }
+        timing.busy = false;
+        timing.recent = [];
+        timing.rest = 8; // pictures until the change shows (the camera lags by about 0.2 s)
+    };
+    const steerOn = (good, margin) => {
+        if (margin < 25) return; // a blank frame says nothing about the timing
+        if (timing.busy) return;
+        if (timing.rest > 0) { timing.rest--; return; }
+        timing.recent.push(good / bands);
+        if (timing.recent.length > 3) timing.recent.shift();
+        if (timing.recent.length < 3) return;
+        const q = timing.recent.reduce((a, b) => a + b, 0) / 3;
+        if (q > 0.75) { timing.tries = 0; return; }
+        // more than a full turn of slides didn't help: it's something else (focus, light); leave it a while
+        if (timing.tries >= 5) { timing.tries = 0; timing.rest = 60; return; }
+        timing.tries++;
+        steerCamera();
+    };
+    // Keep the squares' positions on the code as the picture shifts (see refineY)
+    let grabs = 0;
+    const refine = (Y, stride, rows, x, y) => {
+        const r0 = performance.now();
+        const moved = an.refineY(Y, stride, rows, x, y);
+        s.refineMs += performance.now() - r0;
+        s.refines++;
+        s.moves.push(moved === null ? -1 : +moved.toFixed(2));
+    };
+    // Read the next camera frame and copy the card region's brightness. Started before the
+    // current picture is decoded, so the copy (done off the main thread) overlaps the decoding.
+    const grab = async () => {
+        const { value, done } = await reader.read();
+        if (done) return { done: true };
+        const c = crop, buf = yBufs[bufTurn++ % yBufs.length];
+        try {
+            if (!an.positions || !c) return { stale: true };
+            const rect = { x: c.x, y: c.y, width: c.w, height: c.h };
+            const need = value.allocationSize({ rect });
+            if (!buf.b || buf.b.length < need) buf.b = new Uint8Array(need);
+            const layout = await value.copyTo(buf.b, { rect });
+            if (value.format !== 'I420' && value.format !== 'NV12' && value.format !== 'I420A') throw new Error(`frame format ${value.format}`);
+            if (!an.positions || c !== crop) return { stale: true };
+            if (track && ++grabs % track === 0) refine(buf.b.subarray(layout[0].offset), layout[0].stride, c.h, c.x, c.y);
+            const lum = colour ? an.sampleYUV(buf.b, layout, value.format, c.h, c.x, c.y)
+                : an.sampleY(buf.b.subarray(layout[0].offset), layout[0].stride, c.h, c.x, c.y);
+            return { crop: c, ts: value.timestamp, lum };
+        } catch (e) {
+            return { error: String(e.message || e) };
+        } finally {
+            value.close();
+        }
+    };
     const t0 = performance.now();
     // Ask for the next camera frame before processing the current one, so a frame that
     // arrives while we're busy is waiting for us instead of being skipped
@@ -1490,17 +1734,31 @@ async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds
         while (performance.now() - t0 < seconds * 1000 && !dec.isDone) {
             // Once locked on, read frames straight from the camera track: they arrive as the
             // camera makes them, not on the screen's repaint schedule (which cost ~17 ms a frame)
-            let trackFrame = null;
+            let trackFrame = null, ready = null;
             if (an.positions && useFrames && typeof MediaStreamTrackProcessor !== 'undefined') {
                 if (!reader) {
                     readerTrack = video.srcObject.getVideoTracks()[0].clone();
                     reader = new MediaStreamTrackProcessor({ track: readerTrack, maxBufferSize: 1 }).readable.getReader();
                 }
-                const { value, done } = await reader.read();
-                if (done) break;
-                trackFrame = value;
-                if (lastTs !== null) s.skipped += Math.max(0, Math.round((value.timestamp - lastTs) / 33333) - 1);
-                lastTs = value.timestamp;
+                if (prefetch) {
+                    const w0 = performance.now();
+                    const got = await (nextGrab || grab());
+                    nextGrab = null;
+                    if (got.done) break;
+                    if (got.error) { useFrames = false; gpuCheck = `VideoFrame: ${got.error}`; continue; }
+                    if (got.stale || got.crop !== crop) continue; // copied before a re-lock
+                    nextGrab = grab(); // the next copy runs while this picture is decoded
+                    s.grabWaitMs += performance.now() - w0;
+                    ready = got;
+                    if (lastTs !== null) s.skipped += Math.max(0, Math.round((got.ts - lastTs) / 33333) - 1);
+                    lastTs = got.ts;
+                } else {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    trackFrame = value;
+                    if (lastTs !== null) s.skipped += Math.max(0, Math.round((value.timestamp - lastTs) / 33333) - 1);
+                    lastTs = value.timestamp;
+                }
             } else {
                 const meta = await pending;
                 pending = nextVideoFrame(video);
@@ -1519,6 +1777,7 @@ async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds
                 img = ctx.getImageData(0, 0, W, H);
                 if (!an.locate(img)) { s.unlocked++; continue; }
                 s.lockOns++;
+                s.lockLog.push({ t: Math.round(performance.now() - t0), score: an.meshScore && +an.meshScore.toFixed(3), corners: an.corners, at: s.pictures });
                 // Prefer the GPU: it reads just the square centres instead of copying the picture
                 sampler = null;
                 if (gpu) {
@@ -1556,8 +1815,10 @@ async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds
                 oy = crop.y;
             }
             let lum;
-            if (img) {
-                lum = an.sample(img, ox, oy);
+            if (ready) {
+                lum = ready.lum;
+            } else if (img) {
+                lum = colour ? an.sampleRGB(img, ox, oy) : an.sample(img, ox, oy);
             } else if (useFrames) {
                 const f = trackFrame || new VideoFrame(video);
                 const rect = { x: crop.x, y: crop.y, width: crop.w, height: crop.h };
@@ -1566,7 +1827,9 @@ async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds
                     if (!yBuf || yBuf.length < need) yBuf = new Uint8Array(need); // the region can change after a re-lock
                     const layout = await f.copyTo(yBuf, { rect });
                     if (f.format !== 'I420' && f.format !== 'NV12' && f.format !== 'I420A') throw new Error(`frame format ${f.format}`);
-                    lum = an.sampleY(yBuf.subarray(layout[0].offset), layout[0].stride, crop.h, crop.x, crop.y);
+                    if (track && s.pictures % track === 0) refine(yBuf.subarray(layout[0].offset), layout[0].stride, crop.h, crop.x, crop.y);
+                    lum = colour ? an.sampleYUV(yBuf, layout, f.format, crop.h, crop.x, crop.y)
+                        : an.sampleY(yBuf.subarray(layout[0].offset), layout[0].stride, crop.h, crop.x, crop.y);
                 } catch (e) {
                     useFrames = false; // fall back to the canvas path from the next picture
                     trackFrame = null;
@@ -1579,32 +1842,41 @@ async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds
                 lum = sampler.sample(video);
             }
             const g1 = performance.now();
-            const bits = threshold(rfc, lum);
-            const packets = readFrame(rfc, bits, rsDecode);
-            let good = 0;
-            packets.forEach((p, b) => { if (!p) s.badByBand[b] = (s.badByBand[b] || 0) + 1; });
-            for (const p of packets) {
-                if (!p) { s.bandsBad++; continue; }
-                s.bandsOk++;
-                good++;
-                if (s.firstGood === null) s.firstGood = performance.now();
-                dec.addDroplet(p);
-            }
-            // A bad lock shows up as picture after picture with no good band: drop it and lock
-            // on again (the sender shows a blank frame every so often for exactly this)
-            badStreak = good ? 0 : badStreak + 1;
-            if (badStreak >= 40) {
-                an.positions = null;
-                an.map = null;
-                badStreak = 0;
-                s.relocks++;
+            if (colour && s.sep.length < 12) s.sep.push(colourSeparation(rfc, lum));
+            const live = pool.filter(w => !w.failed);
+            if (live.length) {
+                const free = live.find(w => !w.busy);
+                if (free) {
+                    free.busy = true;
+                    free.worker.postMessage({ type: 'picture', id: s.pictures, lum }, [lum.buffer]);
+                } else {
+                    s.dropped++;
+                }
+            } else {
+                const bits = threshold(rfc, lum);
+                const g2 = performance.now();
+                const packets = readFrame(rfc, bits, rsDecode, readOpts);
+                s.thresholdMs += g2 - g1;
+                s.readMs += performance.now() - g2;
+                s.rescued = rfc.rescued || 0;
+                s.decoded++;
+                // how clearly the squares separate (sampled): low = blurred or two frames mixed
+                if (rfc.margin) { let v = 0, c = 0; for (let j = 0; j < rfc.margin.length; j += 97) { v += rfc.margin[j]; c++; } s.marginSeq.push(Math.round(v / c)); }
+                const okBands = steer ? packets.reduce((a, q) => a + (q ? 1 : 0), 0) : 0;
+                if (steer) steerOn(okBands, s.marginSeq[s.marginSeq.length - 1]);
+                const a0 = performance.now();
+                takePackets(packets);
+                s.addSeq.push(+(performance.now() - a0).toFixed(1));
+                s.workSeq.push(+(g2 - g1).toFixed(1), +(a0 - g2).toFixed(1));
             }
             s.grabMs += g1 - g0;
+            s.grabSeq.push(+(g1 - g0).toFixed(1));
             s.decodeMs += performance.now() - g1;
             lastWorkEnd = performance.now();
         }
     } finally {
         cardBusy = false;
+        for (const w of pool) w.worker.terminate();
         if (reader) { try { reader.cancel(); } catch (e) {} }
         if (readerTrack) readerTrack.stop();
     }
@@ -1632,6 +1904,12 @@ async function receiveRfc({ grid = 249, bands = 8, ecc = 16, levels = 2, seconds
         squarePx: an.modulePx ? +an.modulePx.toFixed(2) : null,
         crop: crop ? `${crop.w}x${crop.h}` : null,
         sampler: useFrames ? 'videoframe' : sampler ? 'gpu' : 'canvas', gpuCheck,
+        rs: fastRs ? 'rs.js' : 'jsQR', erasures: readOpts.erasures, prefetch,
+        grabWaitMs: s.pictures ? +(s.grabWaitMs / s.pictures).toFixed(1) : null,
+        thresholdMs: s.decoded ? +(s.thresholdMs / s.decoded).toFixed(1) : null,
+        readMs: s.decoded ? +(s.readMs / s.decoded).toFixed(1) : null,
+        rescued: s.rescued, decoded: s.decoded, dropped: s.dropped, colourSeparation: s.sep, seq: s.seq, marginSeq: s.marginSeq, lockLog: s.lockLog, steer, steerLog: timing.log, steerError: timing.error || null, addSeq: s.addSeq, workSeq: s.workSeq, grabSeq: s.grabSeq, refineMs: s.refines ? +(s.refineMs / s.refines).toFixed(1) : null, moves: s.moves, goodHist: Array.from({ length: bands + 1 }, (_, k) => s.goodHist[k] || 0),
+        workers: pool.filter(w => !w.failed).length, workerError: (pool.find(w => w.failed) || {}).failed || null,
         badByBand: s.badByBand, cameraFramesSkipped: s.skipped, avgWaitMs: s.pictures ? Math.round(s.idleMs / s.pictures) : null,
     };
     report('rfc-done', result);
@@ -1778,6 +2056,9 @@ const LAB_COMMANDS = {
 
     // Sender: beam a payload with RapidFire code v1. { kb, fps, grid, bands, ecc, blank, blankEvery }
     'rfc-send': async (args = {}) => startRfc(args),
+
+    // Sender: when each frame was drawn [refresh time ms, draw ms, callback delay ms]
+    'rfc-timing': async () => (rfcRun ? { timing: rfcRun.timing, buildMs: rfcRun.buildMs, late: rfcRun.late || 0, worker: !!rfcRun.worker, workerError: rfcRun.workerError } : null),
 
     // Receiver: receive one RapidFire code v1 transfer. { grid, bands, ecc, seconds }
     'rfc-receive': async (args = {}) => receiveRfc(args),

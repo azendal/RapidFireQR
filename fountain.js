@@ -2,7 +2,8 @@
 //
 // The sender splits the data into K blocks and emits an endless stream of droplets:
 //   droplet 0 .. K-1  carry block 0 .. K-1 as they are (systematic part),
-//   droplet K ..      each carry the XOR of a random half of the blocks (repair part).
+//   droplet K ..      each carry the XOR of a random set of blocks (repair part): half of them
+//                     for small files, 64 or 256 of them for big ones (see dropletCoefficients).
 // The receiver solves the droplets it has caught with incremental Gaussian elimination,
 // so it needs about K + 2 useful droplets no matter which ones it missed.
 //
@@ -35,6 +36,17 @@ export function dropletCoefficients(dropletId, K) {
         return bits;
     }
     const rand = mulberry32(dropletId * 0x9E3779B1);
+    if (K > 600) {
+        // Half of a big file's blocks is thousands of XORs per droplet, on both ends. A mix of 64
+        // and 256 blocks needs at most a handful more droplets (0-12 of 4300 in simulations with
+        // 3-60% loss): the bigger ones make sure the last few missing blocks get covered.
+        const degree = (rand() >>> 31) ? 64 : 256;
+        for (let d = 0; d < degree; d++) {
+            const i = rand() % K;
+            bits[i >>> 5] |= 1 << (i & 31);
+        }
+        return bits;
+    }
     for (let w = 0; w < words; w++) bits[w] = rand();
     const tail = K & 31;
     if (tail) bits[words - 1] &= (1 << tail) - 1;
@@ -115,6 +127,10 @@ export function readHeader(packet) {
     };
 }
 
+function xorInto(a, b) {
+    for (let k = 0; k < a.length; k++) a[k] ^= b[k];
+}
+
 export class FountainDecoder {
     constructor() {
         this.reset();
@@ -125,7 +141,7 @@ export class FountainDecoder {
         this.K = null;
         this.totalLength = null;
         this.chunkSize = null;
-        this.pivots = [];          // pivots[col] = { bits: Uint32Array, data: Uint32Array } | null
+        this.pivots = [];          // pivots[col] = { bits: Uint32Array | null (null: exactly this block), data } | null
         this.solvedCount = 0;      // rank of the system: how many blocks are pinned down
         this.receivedCount = 0;    // distinct droplets read
         this.isDone = false;
@@ -161,36 +177,61 @@ export class FountainDecoder {
         bytes.set(packet.subarray(HEADER_BYTES));
         const data = new Uint32Array(bytes.buffer);
 
-        // Eliminate known pivots from lowest column up. The first set column with no
-        // pivot becomes this row's pivot; every column below it is then already zero.
+        // Reduce the row. Blocks already known outright (unit pivots, data: the block itself) are
+        // removed wherever they appear, so stored rows only ever mention blocks that were missing:
+        // a big file's last step would otherwise mix thousands of known blocks into each row.
+        // Other pivots are eliminated from the lowest column up until the first missing column,
+        // which becomes this row's pivot.
         const words = bits.length;
+        let lead = -1;
         for (let w = 0; w < words; w++) {
-            while (bits[w]) {
-                const col = (w << 5) + (31 - Math.clz32(bits[w] & -bits[w]));
+            let todo = bits[w];
+            while (todo) {
+                const low = todo & -todo;
+                const col = (w << 5) + (31 - Math.clz32(low));
                 const pivot = this.pivots[col];
-                if (!pivot) {
-                    this.pivots[col] = { bits, data };
-                    this.solvedCount++;
-                    if (this.solvedCount === this.K) this.finish();
-                    return true;
+                if (pivot && !pivot.bits) {
+                    bits[w] ^= low;
+                    xorInto(data, pivot.data);
+                    todo ^= low;
+                } else if (pivot && lead < 0) {
+                    for (let k = w; k < words; k++) bits[k] ^= pivot.bits[k];
+                    xorInto(data, pivot.data);
+                    // the pivot's own column is clear now; others in this word may have appeared
+                    todo = low === -2147483648 || low === 0x80000000 ? 0 : bits[w] & ~((low << 1) - 1);
+                } else {
+                    if (lead < 0) lead = col;
+                    todo ^= low;
                 }
-                for (let k = w; k < words; k++) bits[k] ^= pivot.bits[k];
-                for (let k = 0; k < data.length; k++) data[k] ^= pivot.data[k];
             }
         }
-        return false; // nothing new: a combination of droplets already held
+        if (lead < 0) return false; // nothing new: a combination of droplets already held
+        let single = true;
+        for (let w = 0; w < words && single; w++) {
+            const want = w === lead >>> 5 ? (1 << (lead & 31)) | 0 : 0;
+            if ((bits[w] | 0) !== want) single = false;
+        }
+        this.pivots[lead] = { bits: single ? null : bits, data };
+        this.solvedCount++;
+        if (this.solvedCount === this.K) this.finish();
+        return true;
     }
 
     // Back-substitution: clear every column above each pivot, highest pivot first.
     finish() {
         for (let col = this.K - 1; col >= 0; col--) {
             const row = this.pivots[col];
-            for (let j = col + 1; j < this.K; j++) {
-                if (row.bits[j >>> 5] & (1 << (j & 31))) {
-                    const other = this.pivots[j].data;
-                    for (let k = 0; k < row.data.length; k++) row.data[k] ^= other[k];
+            if (!row.bits) continue;
+            for (let w = col >>> 5; w < row.bits.length; w++) {
+                let todo = row.bits[w];
+                if (w === col >>> 5) todo &= (col & 31) === 31 ? 0 : -1 << ((col & 31) + 1); // above col only
+                while (todo) {
+                    const low = todo & -todo;
+                    todo ^= low;
+                    xorInto(row.data, this.pivots[(w << 5) + (31 - Math.clz32(low))].data);
                 }
             }
+            row.bits = null;
         }
         this.blocks = this.pivots.map(p => new Uint8Array(p.data.buffer, 0, this.chunkSize));
         this.isDone = true;

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rapidfireqr-v2.16';
+const CACHE_NAME = 'rapidfireqr-v2.29';
 const ASSETS = [
   '/',
   '/index.html',
@@ -9,6 +9,8 @@ const ASSETS = [
   '/envelope.js',
   '/card.js',
   '/rfc.js',
+  '/rs.js',
+  '/rfc-worker.js', '/rfc-send-worker.js',
   '/gpusample.js',
   '/qrcode.min.js',
   '/jsqr.js',

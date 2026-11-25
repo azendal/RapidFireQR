@@ -125,20 +125,51 @@ export class CardAnalyzer {
     // 4. Bend it locally with the alignment marks (meshMap).
     locate(img) {
         const jsQR = window.jsQR;
-        const { binarized } = jsQR.internals.binarize(img.data, img.width, img.height, false);
         const { N, dataIndex } = this.layout;
         if (!this.fixedIndex) {
             this.fixedIndex = [];
             for (let i = 0; i < N * N; i++) if (this.layout.fixed[i] >= 0) this.fixedIndex.push(i);
         }
         this.debug = {};
-        const finders = findFinders(binarized);
-        this.debug.finders = finders.slice(0, 6).map(f => [Math.round(f.x), Math.round(f.y), f.n, +f.size.toFixed(1)]);
-        // the four strongest of similar size (a speck in glare or noise can be hit a few times,
-        // but it won't be the size of a real finder)
-        const ref = finders.slice(0, 3).map(f => f.size).sort((a, b) => a - b)[1];
-        const top = finders.filter(f => f.size > ref * 0.65 && f.size < ref * 1.5).slice(0, 4);
-        if (top.length < 4) return false;
+        // Candidates from the 1:1:3:1:1 scan, each checked against the whole finder pattern: in a
+        // dense code random data imitates the scan's ratios often, the 9x9 pattern never. Up close
+        // the screen's own pixel rows break the scan's runs, so a blurred copy is tried as well.
+        let verified = [];
+        for (const blur of [0, 1, 2]) {
+            const src = blur ? blurLum(img, blur) : img;
+            const { binarized } = jsQR.internals.binarize(src.data, img.width, img.height, false);
+            for (const f of findFinders(binarized).slice(0, 400)) {
+                if (verified.some(v => Math.hypot(v.x - f.x, v.y - f.y) < f.size)) continue;
+                const m = matchFinder(src, f.x, f.y, f.size / 7);
+                if (m.r > 0.75) verified.push({ ...m, size: m.px * 7, n: f.n });
+            }
+            if (verified.length >= 4) break;
+        }
+        verified.sort((p, q) => q.r - p.r);
+        this.debug.finders = verified.slice(0, 6).map(f => [Math.round(f.x), Math.round(f.y), +f.r.toFixed(2), +f.size.toFixed(1)]);
+        if (verified.length < 3) return false;
+        const ref = verified.slice(0, 3).map(f => f.size).sort((a, b) => a - b)[1];
+        let top = verified.filter(f => f.size > ref * 0.65 && f.size < ref * 1.5).slice(0, 4);
+        if (top.length < 3) return false;
+        if (top.length === 3) {
+            // one corner is missing: it completes the parallelogram of the other three, give or
+            // take perspective; look for the pattern around there
+            const d = (p, q) => Math.hypot(top[p].x - top[q].x, top[p].y - top[q].y);
+            const [c, p, q] = [[0, 1, 2], [1, 0, 2], [2, 0, 1]].sort((u, v) => d(v[1], v[2]) - d(u[1], u[2]))[0]; // c: opposite the longest side
+            const gx = top[p].x + top[q].x - top[c].x, gy = top[p].y + top[q].y - top[c].y;
+            const reach = d(p, q) * 0.12, step = ref / 14;
+            let found = null;
+            for (let y = gy - reach; y <= gy + reach; y += step) {
+                for (let x = gx - reach; x <= gx + reach; x += step) {
+                    const r = finderCorrelation(img, x, y, ref / 7);
+                    if (!found || r > found.r) found = { x, y, r };
+                }
+            }
+            const m = found && matchFinder(img, found.x, found.y, ref / 7);
+            if (!m || m.r < 0.7) return false;
+            this.debug.fourth = [Math.round(m.x), Math.round(m.y), +m.r.toFixed(2)];
+            top.push({ ...m, size: m.px * 7 });
+        }
         const px = top.reduce((a, f) => a + f.size, 0) / 4 / 7;
         // cyclic order around their centre
         const cx = top.reduce((a, f) => a + f.x, 0) / 4, cy = top.reduce((a, f) => a + f.y, 0) / 4;
@@ -175,12 +206,25 @@ export class CardAnalyzer {
             const meshed = this.meshMap(img, f.map);
             const r = this.fixedCorrelation(img, meshed);
             if (r < 0.7) continue;
+            // all 16 squares have to fit: random data in the same place can easily average
+            // darker in one row than the other, but not match square by square
+            const cell = (x, y) => {
+                let v = 0;
+                for (const [ox, oy] of [[0, 0], [-0.2, 0], [0.2, 0], [0, -0.2], [0, 0.2]]) v += lumAt(...meshed(x + ox, y + oy));
+                return v / 5;
+            };
             let dark = 0, light = 0;
+            const D = [], Lt = [];
             for (let x = 0; x < 8; x++) {
-                dark += lumAt(...meshed(x + 0.5, 8.5));
-                light += lumAt(...meshed(x + 0.5, 9.5));
+                const d = cell(x + 0.5, 8.5), l = cell(x + 0.5, 9.5);
+                D.push(d); Lt.push(l);
+                dark += d; light += l;
             }
-            const bar = (light - dark) / 8;
+            const md = dark / 8, ml = light / 8;
+            let spread = 0;
+            for (let x = 0; x < 8; x++) spread += (D[x] - md) ** 2 + (Lt[x] - ml) ** 2;
+            // difference between the rows, less how uneven the rows themselves are
+            const bar = (ml - md) - 1.5 * Math.sqrt(spread / 16);
             if (!best || bar > best.bar) best = { r, bar, map: meshed, offsets: this.meshOffsets };
         }
         this.meshScore = best ? best.r : null;
@@ -199,6 +243,7 @@ export class CardAnalyzer {
         this.modulePx = (Math.hypot(b[0] - a[0], b[1] - a[1]) + Math.hypot(c[0] - a[0], c[1] - a[1])) / 2 / N;
         this.positions = pos;
         this.map = map;
+        this.track = null; // refineY() starts over from this lock
         this.corners = [a, b, map(N, N), c].map(p => [Math.round(p[0]), Math.round(p[1])]);
         return true;
     }
@@ -239,34 +284,61 @@ export class CardAnalyzer {
             }
             return { r: bestR, bx, by };
         };
-        // Pass 1: wide search around the global prediction
-        const R1 = Math.max(4, Math.ceil(px * 1.5));
+        // Spread outward from the corner finders: each mark is looked for near where its matched
+        // neighbours say it should be. Lens distortion can move marks in the middle of an edge by
+        // several squares (more than a search around the global fit can tell apart from a
+        // neighbouring square), but it changes little from one mark to the next.
         const results = [];
-        controls.forEach((c, idx) => {
-            if (c.finder) return;
-            const res = search(c, 0, 0, R1);
-            results[idx] = res;
-            if (res.r > 0.6) { off[idx * 2] = res.bx; off[idx * 2 + 1] = res.by; ok[idx] = 1; }
-        });
-        // Pass 2: marks that didn't match start from their matched neighbours' average offset
-        for (let pass = 0; pass < 2; pass++) {
-            controls.forEach((c, idx) => {
-                if (ok[idx]) return;
-                const i = idx % m, j = (idx / m) | 0;
-                let sx = 0, sy = 0, n = 0;
-                for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
-                    const ii = i + di, jj = j + dj;
-                    if (ii < 0 || jj < 0 || ii >= m || jj >= m || !ok[jj * m + ii]) continue;
-                    sx += off[(jj * m + ii) * 2]; sy += off[(jj * m + ii) * 2 + 1]; n++;
+        const at = (i, j) => (i >= 0 && j >= 0 && i < m && j < m && ok[j * m + i] ? j * m + i : -1);
+        const predict = (i, j) => {
+            let sx = 0, sy = 0, w = 0, n = 0;
+            for (let dj = -1; dj <= 1; dj++) for (let di = -1; di <= 1; di++) {
+                if (!di && !dj) continue;
+                const a = at(i + di, j + dj);
+                if (a < 0) continue;
+                n++;
+                // with two matched marks in a line, follow the trend; otherwise repeat the neighbour
+                const b = at(i + 2 * di, j + 2 * dj);
+                const wt = b >= 0 ? 2 : 1;
+                sx += wt * (b >= 0 ? 2 * off[a * 2] - off[b * 2] : off[a * 2]);
+                sy += wt * (b >= 0 ? 2 * off[a * 2 + 1] - off[b * 2 + 1] : off[a * 2 + 1]);
+                w += wt;
+            }
+            return n ? { x: sx / w, y: sy / w, n } : null;
+        };
+        const R = Math.max(2, Math.ceil(px * 1.1));
+        for (const accept of [0.8, 0.6, 0.45]) {
+            for (let progress = true; progress;) {
+                progress = false;
+                // marks with the most matched neighbours first
+                const next = [];
+                controls.forEach((c, idx) => {
+                    if (ok[idx] || (results[idx] && results[idx].tried === accept && results[idx].again <= 0)) return;
+                    const g = predict(idx % m, (idx / m) | 0);
+                    if (g) next.push([g.n, idx]);
+                });
+                next.sort((p, q) => q[0] - p[0]);
+                for (const [, idx] of next) {
+                    const g = predict(idx % m, (idx / m) | 0);
+                    const c = controls[idx], old = results[idx];
+                    const res = search(c, Math.round(g.x * 2) / 2, Math.round(g.y * 2) / 2, R);
+                    res.tried = accept;
+                    res.again = old && old.tried === accept ? old.again - 1 : 2; // a few retries as neighbours fill in
+                    results[idx] = res;
+                    if (res.r > accept) {
+                        off[idx * 2] = res.bx;
+                        off[idx * 2 + 1] = res.by;
+                        ok[idx] = 1;
+                    }
+                    progress = true;
                 }
-                if (!n) return;
-                const res = search(c, sx / n, sy / n, Math.max(2, Math.ceil(px * 0.8)));
-                results[idx] = res;
-                off[idx * 2] = res.r > 0.45 ? res.bx : sx / n;
-                off[idx * 2 + 1] = res.r > 0.45 ? res.by : sy / n;
-                if (res.r > 0.45) ok[idx] = 1;
-            });
+            }
         }
+        controls.forEach((c, idx) => {
+            if (ok[idx]) return;
+            const g = predict(idx % m, (idx / m) | 0);
+            if (g) { off[idx * 2] = g.x; off[idx * 2 + 1] = g.y; }
+        });
         this.meshOffsets = controls.map((c, idx) => [c.x, c.y, off[idx * 2], off[idx * 2 + 1], results[idx] ? +results[idx].r.toFixed(2) : 1]);
         const cellOf = (v) => {
             let i = 0;
@@ -333,14 +405,212 @@ export class CardAnalyzer {
         return out;
     }
 
+    // Follow small changes since the lock (the lens refocusing changes the picture's scale by a
+    // pixel or two, a hand-held camera drifts): measure where a spread of the alignment marks are
+    // now in a brightness plane, fit one affine correction, and move every square by it.
+    // Returns the largest corner movement in pixels, or null if too few marks were found.
+    refineY(Y, stride, rows, ox, oy) {
+        const { lattice, controls, dataIndex } = this.layout;
+        const m = lattice.length;
+        if (!this.track) {
+            const step = Math.max(1, Math.round(m / 12));
+            const marks = [];
+            controls.forEach((c, idx) => {
+                const i = idx % m, j = (idx / m) | 0;
+                if (c.finder || (i % step && i !== m - 1) || (j % step && j !== m - 1)) return;
+                const cells = new Float64Array(50);
+                let k = 0;
+                for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) {
+                    const [x, y] = this.map(c.x + dx + 0.5, c.y + dy + 0.5);
+                    cells[k++] = x;
+                    cells[k++] = y;
+                }
+                marks.push(cells);
+            });
+            const want = new Float64Array(25);
+            let k = 0;
+            for (let dy = -2; dy <= 2; dy++) for (let dx = -2; dx <= 2; dx++) want[k++] = Math.max(Math.abs(dx), Math.abs(dy)) === 1 ? 1 : 0;
+            this.track = { marks, want };
+        }
+        const { marks, want } = this.track;
+        // least squares for dx = a + b x + c y (same for dy), x and y measured from the centre
+        let cx = 0, cy = 0;
+        for (const q of marks) { cx += q[24]; cy += q[25]; }
+        cx /= marks.length;
+        cy /= marks.length;
+        const found = [];
+        const scores = new Float64Array(81);
+        const st = Math.max(0.4, this.modulePx * 0.13); // search step: about +-half a square in all
+        for (const q of marks) {
+            let best = -2, bi = 0;
+            for (let t = 0; t < 81; t++) {
+                const sx = ((t % 9) - 4) * st, sy = (((t / 9) | 0) - 4) * st;
+                let sv = 0, svv = 0, svw = 0, sw = 0, n = 0;
+                for (let k = 0; k < 25; k++) {
+                    const x = Math.floor(q[k * 2] + sx) - ox, y = Math.floor(q[k * 2 + 1] + sy) - oy;
+                    if (x < 0 || y < 0 || x >= stride || y >= rows) continue;
+                    const v = Y[y * stride + x];
+                    sv += v; svv += v * v; svw += v * want[k]; sw += want[k]; n++;
+                }
+                const vx = n === 25 ? svv - (sv * sv) / n : 0;
+                const r = vx > 0 ? (svw - (sv * sw) / n) / Math.sqrt(vx * (sw - (sw * sw) / n)) : -1;
+                scores[t] = r;
+                if (r > best) { best = r; bi = t; }
+            }
+            if (best < 0.6) continue;
+            // the middle of the well-matching offsets (the match is flat-topped: squares are wide)
+            let w = 0, wx = 0, wy = 0;
+            for (let t = 0; t < 81; t++) {
+                const g = scores[t] - (best - 0.12);
+                if (g <= 0) continue;
+                w += g; wx += g * ((t % 9) - 4) * st; wy += g * (((t / 9) | 0) - 4) * st;
+            }
+            found.push([q[24] - cx, q[25] - cy, wx / w, wy / w]);
+        }
+        if (found.length < Math.max(12, marks.length * 0.4)) return null;
+        const fit = (use, k) => {
+            const A = [[0, 0, 0], [0, 0, 0], [0, 0, 0]], b = [0, 0, 0];
+            for (const f of use) {
+                const row = [1, f[0], f[1]];
+                for (let i = 0; i < 3; i++) { for (let j = 0; j < 3; j++) A[i][j] += row[i] * row[j]; b[i] += row[i] * f[k]; }
+            }
+            for (let i = 0; i < 3; i++) {
+                let piv = i;
+                for (let r = i + 1; r < 3; r++) if (Math.abs(A[r][i]) > Math.abs(A[piv][i])) piv = r;
+                [A[i], A[piv]] = [A[piv], A[i]];
+                [b[i], b[piv]] = [b[piv], b[i]];
+                if (Math.abs(A[i][i]) < 1e-9) return null;
+                for (let r = 0; r < 3; r++) {
+                    if (r === i) continue;
+                    const g = A[r][i] / A[i][i];
+                    for (let c = i; c < 3; c++) A[r][c] -= g * A[i][c];
+                    b[r] -= g * b[i];
+                }
+            }
+            return b.map((v, i) => v / A[i][i]);
+        };
+        let use = found, fx = null, fy = null;
+        for (let pass = 0; pass < 2; pass++) {
+            fx = fit(use, 2);
+            fy = fit(use, 3);
+            if (!fx || !fy) return null;
+            const kept = found.filter(f => Math.hypot(fx[0] + fx[1] * f[0] + fx[2] * f[1] - f[2], fy[0] + fy[1] * f[0] + fy[2] * f[1] - f[3]) < Math.max(0.8, this.modulePx * 0.25));
+            if (kept.length < Math.max(12, marks.length * 0.35)) return null;
+            use = kept;
+        }
+        let moved = 0;
+        for (const [x, y] of this.corners) {
+            const u = x - cx, v = y - cy;
+            moved = Math.max(moved, Math.hypot(fx[0] + fx[1] * u + fx[2] * v, fy[0] + fy[1] * u + fy[2] * v));
+        }
+        if (moved < 0.2) return moved; // nothing worth moving
+        const shift = (arr) => {
+            for (let k = 0; k < arr.length; k += 2) {
+                const u = arr[k] - cx, v = arr[k + 1] - cy;
+                arr[k] += fx[0] + fx[1] * u + fx[2] * v;
+                arr[k + 1] += fy[0] + fy[1] * u + fy[2] * v;
+            }
+        };
+        shift(this.positions);
+        for (const q of marks) shift(q);
+        this.corners = this.corners.map(([x, y]) => {
+            const u = x - cx, v = y - cy;
+            return [x + fx[0] + fx[1] * u + fx[2] * v, y + fy[0] + fy[1] * u + fy[2] * v];
+        });
+        return moved;
+    }
+
     // Same as sample(), but from a brightness (Y) plane: Y[(y - oy) * stride + (x - ox)]
     sampleY(Y, stride, rows, ox, oy) {
         const pos = this.positions;
         const n = pos.length / 2;
         const out = new Float32Array(n);
+        // with enough camera pixels per square, average a small window (less noise, and it evens
+        // out the dark gaps between the screen's own pixels)
+        const r = this.modulePx >= 4 ? Math.floor(this.modulePx * 0.25) : 0;
+        if (r > 0) {
+            const inv = 1 / ((2 * r + 1) * (2 * r + 1));
+            for (let j = 0; j < n; j++) {
+                const x = Math.floor(pos[j * 2]) - ox, y = Math.floor(pos[j * 2 + 1]) - oy;
+                if (x < r || y < r || x >= stride - r || y >= rows - r) { out[j] = 128; continue; }
+                let v = 0;
+                for (let yy = y - r; yy <= y + r; yy++) {
+                    const o = yy * stride + x;
+                    for (let k = o - r; k <= o + r; k++) v += Y[k];
+                }
+                out[j] = v * inv;
+            }
+            return out;
+        }
         for (let j = 0; j < n; j++) {
             const x = Math.floor(pos[j * 2]) - ox, y = Math.floor(pos[j * 2 + 1]) - oy;
             out[j] = x >= 0 && y >= 0 && x < stride && y < rows ? Y[y * stride + x] : 128;
+        }
+        return out;
+    }
+
+    // Red, green, blue per point (interleaved), from an RGBA picture
+    sampleRGB(img, ox = 0, oy = 0) {
+        const { width: W, height: H, data } = img;
+        const pos = this.positions, n = pos.length / 2;
+        const out = new Float32Array(n * 3);
+        for (let j = 0; j < n; j++) {
+            const x = Math.floor(pos[j * 2]) - ox, y = Math.floor(pos[j * 2 + 1]) - oy;
+            if (x < 0 || y < 0 || x >= W || y >= H) { out[j * 3] = out[j * 3 + 1] = out[j * 3 + 2] = 128; continue; }
+            const k = (y * W + x) * 4;
+            out[j * 3] = data[k]; out[j * 3 + 1] = data[k + 1]; out[j * 3 + 2] = data[k + 2];
+        }
+        return out;
+    }
+
+    // Red, green, blue per point from a camera frame's planes (I420: Y, U, V; NV12: Y, UV).
+    // Colour is stored at half resolution, so each point takes the chroma of its 2x2 block.
+    // The crop origin (ox, oy) must be even.
+    sampleYUV(buf, layout, format, rows, ox, oy) {
+        const pos = this.positions, n = pos.length / 2;
+        const out = new Float32Array(n * 3);
+        const Y = layout[0], nv12 = format === 'NV12';
+        const U = layout[1], V = nv12 ? layout[1] : layout[2];
+        // With enough camera pixels per square, average a window: up close the camera sees the
+        // screen's red, green and blue stripes one by one, and only their mix is the square's colour
+        const r = this.modulePx >= 4 ? Math.round(this.modulePx * 0.3) : 0;
+        if (r > 0) {
+            for (let j = 0; j < n; j++) {
+                const x = Math.floor(pos[j * 2]) - ox, y = Math.floor(pos[j * 2 + 1]) - oy;
+                if (x < r || y < r || x >= Y.stride - r || y >= rows - r) { out[j * 3] = out[j * 3 + 1] = out[j * 3 + 2] = 128; continue; }
+                let yy = 0, u = 0, v = 0, ny = 0, nc = 0;
+                for (let b = y - r; b <= y + r; b++) {
+                    const o = Y.offset + b * Y.stride;
+                    for (let a = x - r; a <= x + r; a++) { yy += buf[o + a]; ny++; }
+                }
+                for (let b = (y - r) >> 1; b <= (y + r) >> 1; b++) {
+                    for (let a = (x - r) >> 1; a <= (x + r) >> 1; a++) {
+                        if (nv12) { const k = U.offset + b * U.stride + a * 2; u += buf[k]; v += buf[k + 1]; }
+                        else { u += buf[U.offset + b * U.stride + a]; v += buf[V.offset + b * V.stride + a]; }
+                        nc++;
+                    }
+                }
+                yy /= ny;
+                u = u / nc - 128;
+                v = v / nc - 128;
+                out[j * 3] = yy + 1.402 * v;
+                out[j * 3 + 1] = yy - 0.344 * u - 0.714 * v;
+                out[j * 3 + 2] = yy + 1.772 * u;
+            }
+            return out;
+        }
+        const cols = Y.stride;
+        for (let j = 0; j < n; j++) {
+            const x = Math.floor(pos[j * 2]) - ox, y = Math.floor(pos[j * 2 + 1]) - oy;
+            if (x < 0 || y < 0 || x >= cols || y >= rows) { out[j * 3] = out[j * 3 + 1] = out[j * 3 + 2] = 128; continue; }
+            const yy = buf[Y.offset + y * Y.stride + x];
+            const cx = x >> 1, cy = y >> 1;
+            let u, v;
+            if (nv12) { const k = U.offset + cy * U.stride + cx * 2; u = buf[k] - 128; v = buf[k + 1] - 128; }
+            else { u = buf[U.offset + cy * U.stride + cx] - 128; v = buf[V.offset + cy * V.stride + cx] - 128; }
+            out[j * 3] = yy + 1.402 * v;
+            out[j * 3 + 1] = yy - 0.344 * u - 0.714 * v;
+            out[j * 3 + 2] = yy + 1.772 * u;
         }
         return out;
     }
@@ -427,6 +697,72 @@ export class CardAnalyzer {
             }),
         };
     }
+}
+
+// How well the 9x9 finder pattern (dark core, white ring, dark ring, white ring) fits at (x, y)
+// with squares px wide: correlation, -1..1. Each square is the average of a few points.
+function finderCorrelation(img, x, y, px) {
+    const { width: W, height: H, data } = img;
+    const q = px * 0.22;
+    let n = 0, sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (let dy = -4; dy <= 4; dy++) {
+        for (let dx = -4; dx <= 4; dx++) {
+            const cx = x + dx * px, cy = y + dy * px;
+            let v = 0, c = 0;
+            for (let k = 0; k < 4; k++) {
+                const xi = Math.floor(cx + (k & 1 ? q : -q)), yi = Math.floor(cy + (k & 2 ? q : -q));
+                if (xi < 0 || yi < 0 || xi >= W || yi >= H) continue;
+                v += data[(yi * W + xi) * 4 + 1];
+                c++;
+            }
+            if (!c) continue;
+            v /= c;
+            const d = Math.max(Math.abs(dx), Math.abs(dy));
+            const want = d === 2 || d === 4 ? 1 : 0;
+            n++; sx += v; sy += want; sxx += v * v; syy += want * want; sxy += v * want;
+        }
+    }
+    if (n < 70) return -1;
+    const vx = sxx - (sx * sx) / n, vy = syy - (sy * sy) / n;
+    return vx > 0 ? (sxy - (sx * sy) / n) / Math.sqrt(vx * vy) : -1;
+}
+
+// Best finder fit near (x, y): small shifts and sizes around the estimate
+function matchFinder(img, x, y, px) {
+    let best = { x, y, px, r: -2 };
+    for (const scale of [0.85, 0.92, 1, 1.08]) {
+        for (let dy = -2; dy <= 2; dy++) {
+            for (let dx = -2; dx <= 2; dx++) {
+                const r = finderCorrelation(img, x + dx * px * 0.4, y + dy * px * 0.4, px * scale);
+                if (r > best.r) best = { x: x + dx * px * 0.4, y: y + dy * px * 0.4, px: px * scale, r };
+            }
+        }
+    }
+    return best;
+}
+
+// The picture's brightness (green) averaged over (2r+1) x (2r+1) pixels, as an RGBA picture
+function blurLum(img, r) {
+    const { width: W, height: H, data } = img;
+    const tmp = new Float32Array(W * H), out = new Uint8ClampedArray(W * H * 4);
+    const inv = 1 / (2 * r + 1);
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            let v = 0;
+            for (let k = -r; k <= r; k++) v += data[(y * W + Math.min(W - 1, Math.max(0, x + k))) * 4 + 1];
+            tmp[y * W + x] = v * inv;
+        }
+    }
+    for (let y = 0; y < H; y++) {
+        for (let x = 0; x < W; x++) {
+            let v = 0;
+            for (let k = -r; k <= r; k++) v += tmp[Math.min(H - 1, Math.max(0, y + k)) * W + x];
+            const o = (y * W + x) * 4;
+            out[o] = out[o + 1] = out[o + 2] = v * inv;
+            out[o + 3] = 255;
+        }
+    }
+    return { data: out, width: W, height: H };
 }
 
 // Centre of a finder square near (x, y): mean-shift on the darkest pixels within the 3×3 core.
